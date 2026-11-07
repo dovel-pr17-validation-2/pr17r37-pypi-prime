@@ -1,0 +1,61 @@
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+MODULE_PROBE = (
+    "textual",
+    "verifiers",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _pythonpath(repo: Path) -> str:
+    paths = [
+        repo / "packages" / "prime" / "src",
+        repo / "packages" / "prime-evals" / "src",
+        repo / "packages" / "prime-sandboxes" / "src",
+        repo / "packages" / "prime-traces" / "src",
+        repo / "packages" / "prime-tunnel" / "src",
+    ]
+    existing = os.environ.get("PYTHONPATH")
+    parts = [str(path) for path in paths]
+    if existing:
+        parts.append(existing)
+    return os.pathsep.join(parts)
+
+
+def _run_probe(script: str) -> dict[str, bool]:
+    repo = _repo_root()
+    env = {
+        **os.environ,
+        "PYTHONPATH": _pythonpath(repo),
+        "PRIME_DISABLE_VERSION_CHECK": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _probe_expression() -> str:
+    names = ", ".join(repr(name) for name in MODULE_PROBE)
+    return f"print(json.dumps({{name: name in sys.modules for name in ({names})}}))"
+
+
+def test_prime_main_import_does_not_load_heavy_runtime() -> None:
+    loaded = _run_probe(f"import json, sys\nimport prime_cli.main\n{_probe_expression()}\n")
+
+    assert loaded == {
+        "textual": False,
+        "verifiers": False,
+    }

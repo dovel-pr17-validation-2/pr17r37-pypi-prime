@@ -1,0 +1,2345 @@
+import json
+import random
+import shlex
+import string
+import subprocess
+import time
+from datetime import datetime, timedelta, timezone
+from inspect import signature
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import click
+import typer
+from prime_sandboxes import (
+    APIClient,
+    APIError,
+    BulkDeleteSandboxResponse,
+    CommandTimeoutError,
+    Config,
+    CreateSandboxRequest,
+    EgressPolicyStatus,
+    HeaderRule,
+    LanNetwork,
+    LanRule,
+    LocalhostForward,
+    PaymentRequiredError,
+    Sandbox,
+    SandboxCheckpoint,
+    SandboxClient,
+    SandboxNotRunningError,
+    StartCommand,
+    UnauthorizedError,
+    VolumeMount,
+)
+from pydantic import ValidationError
+from rich.markup import escape
+from rich.table import Table
+from rich.text import Text
+
+from ..utils import (
+    DefaultCommandGroup,
+    PlainTyper,
+    build_table,
+    confirm_or_skip,
+    format_resources,
+    get_console,
+    human_age,
+    iso_timestamp,
+    json_output_help,
+    obfuscate_env_vars,
+    obfuscate_secrets,
+    output_data_as_json,
+    sort_by_created,
+    status_color,
+    validate_output_format,
+)
+from ..utils.display import SANDBOX_STATUS_COLORS
+from ..utils.plain import _PlainTyperCommand
+from ..utils.time_utils import now_utc, to_utc
+from .sandbox_ssh import ssh_transport
+from .sandbox_volumes import app as sandbox_volumes_app
+from .sandbox_volumes import parse_volume_mount_specs
+
+app = PlainTyper(help="Manage sandboxes", no_args_is_help=True)
+console = get_console()
+
+
+LIST_SANDBOXES_JSON_HELP = json_output_help(
+    ".sandboxes[] = {id, name, image, status, resources, labels[], created_at, "
+    "timeout_minutes, expires_at?}",
+    ".total? = number",
+    ".per_page = number",
+    ".has_next = boolean",
+    ".next_cursor? = string",
+)
+
+SANDBOX_DETAIL_JSON_HELP = json_output_help(
+    ". = {id, name, docker_image, start_command, status, cpu_cores, "
+    "memory_gb, disk_size_gb, disk_mount_path, gpu_count, gpu_type?, "
+    "network_allowlist?, network_denylist?, timeout_minutes, labels[], "
+    "created_at, user_id, team_id, ...}",
+    ".environment_vars? = object",
+    ".secrets? = object",
+    ".advanced_configs? = object",
+)
+
+
+# Statuses where a sandbox is finished and has no remaining lifetime.
+_TERMINAL_SANDBOX_STATUSES = {"TERMINATED", "TIMEOUT", "ERROR"}
+_DEFAULT_SANDBOX_IMAGE = "python:3.11-slim"
+
+
+class _SandboxCreateCommand(_PlainTyperCommand):
+    """Treat a leading positional separator as an omitted image.
+
+    Click normally removes ``--`` and assigns the first token after it to the
+    optional ``docker_image`` positional. Preserve the more useful CLI meaning
+    for ``create -- COMMAND...`` while leaving ``create IMAGE -- COMMAND...``
+    unchanged.
+    """
+
+    def parse_args(self, ctx: typer.Context, args: List[str]) -> List[str]:
+        if "--" in args:
+            separator_index = args.index("--")
+            parser = self.make_parser(ctx)
+            prefix_values, _, _ = parser.parse_args(args=args[:separator_index])
+            if prefix_values.get("docker_image") is None:
+                args = [
+                    *args[:separator_index],
+                    _DEFAULT_SANDBOX_IMAGE,
+                    *args[separator_index:],
+                ]
+        return super().parse_args(ctx, args)
+
+
+def _short_duration(seconds: int) -> str:
+    """Format a positive duration compactly (e.g. '45m', '1h05m', '2d3h')."""
+    if seconds < 60:
+        return "<1m"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        hours, minutes = divmod(seconds // 60, 60)
+        return f"{hours}h{minutes:02d}m" if minutes else f"{hours}h"
+    days, remainder = divmod(seconds, 86400)
+    hours = remainder // 3600
+    return f"{days}d{hours}h" if hours else f"{days}d"
+
+
+def _sandbox_deadline(sandbox: Sandbox) -> Optional[datetime]:
+    """When the sandbox times out, or None if the clock hasn't started.
+
+    Mirrors the backend rule (scheduler): deadline = started_at + timeout_minutes,
+    and the timeout only counts down once the sandbox is RUNNING.
+    """
+    if sandbox.status == "RUNNING" and sandbox.started_at:
+        return to_utc(sandbox.started_at) + timedelta(minutes=sandbox.timeout_minutes)
+    return None
+
+
+def _format_sandbox_expiry(sandbox: Sandbox) -> str:
+    """Human-readable time left before expiry, or the configured timeout budget."""
+    if sandbox.status in _TERMINAL_SANDBOX_STATUSES:
+        return "-"
+    deadline = _sandbox_deadline(sandbox)
+    if deadline is None:
+        # Not running yet — the timeout hasn't started, so show the budget.
+        return f"{sandbox.timeout_minutes}m timeout"
+    remaining = int((deadline - now_utc()).total_seconds())
+    if remaining <= 0:
+        return "expiring"
+    return f"{_short_duration(remaining)} left"
+
+
+def _format_sandbox_for_list(sandbox: Sandbox) -> Dict[str, Any]:
+    """Format sandbox data for list display (both table and JSON)"""
+    deadline = _sandbox_deadline(sandbox)
+    return {
+        "id": sandbox.id,
+        "name": sandbox.name,
+        "image": sandbox.docker_image,
+        "status": sandbox.status,
+        "resources": format_resources(sandbox.cpu_cores, sandbox.memory_gb, sandbox.gpu_count),
+        "region": getattr(sandbox, "region", None),
+        "labels": ", ".join(sandbox.labels) if sandbox.labels else "-",  # For table output
+        "labels_list": sandbox.labels,  # For JSON output
+        "created_at": iso_timestamp(sandbox.created_at),  # For JSON output
+        "age": human_age(sandbox.created_at),  # For table output
+        "expires": _format_sandbox_expiry(sandbox),  # For table output
+        "timeout_minutes": sandbox.timeout_minutes,  # For JSON output
+        "expires_at": iso_timestamp(deadline) if deadline else None,  # For JSON output
+    }
+
+
+def _network_access_description(
+    allowlist: Optional[List[str]],
+    denylist: Optional[List[str]],
+) -> str:
+    if allowlist is not None:
+        return f"Limited to: {', '.join(allowlist)}" if allowlist else "Blocked"
+    if denylist is not None:
+        return f"Blocked: {', '.join(denylist)}" if denylist else "Unrestricted"
+    return "Unrestricted"
+
+
+def _start_command_data(value: StartCommand | None) -> dict[str, Any] | None:
+    return value.model_dump() if value is not None else None
+
+
+def _format_start_command(value: StartCommand | None) -> str:
+    if value is None:
+        return "N/A"
+    return json.dumps([value.executable, *value.args])
+
+
+def _format_sandbox_for_details(sandbox: Sandbox) -> Dict[str, Any]:
+    """Format sandbox data for details display (both table and JSON)"""
+    data: Dict[str, Any] = {
+        "id": sandbox.id,
+        "name": sandbox.name,
+        "type": "VM",
+        "docker_image": sandbox.docker_image,
+        "start_command": _start_command_data(sandbox.start_command),
+        "status": sandbox.status,
+        "cpu_cores": sandbox.cpu_cores,
+        "memory_gb": sandbox.memory_gb,
+        "disk_size_gb": sandbox.disk_size_gb,
+        "disk_mount_path": sandbox.disk_mount_path,
+        "gpu_count": sandbox.gpu_count,
+        "gpu_type": getattr(sandbox, "gpu_type", None),
+        "network_allowlist": getattr(sandbox, "network_allowlist", None),
+        "network_denylist": getattr(sandbox, "network_denylist", None),
+        "timeout_minutes": sandbox.timeout_minutes,
+        # Read with getattr so an older installed prime-sandboxes wheel
+        # (without these fields) still renders the details view instead of
+        # raising AttributeError. The SDK floor will be bumped in a follow-up
+        # release PR.
+        "idle_timeout_minutes": getattr(sandbox, "idle_timeout_minutes", None),
+        "termination_reason": getattr(sandbox, "termination_reason", None),
+        "labels": sandbox.labels,
+        "created_at": iso_timestamp(sandbox.created_at),
+        "user_id": sandbox.user_id,
+        "team_id": sandbox.team_id,
+        "region": getattr(sandbox, "region", None),
+    }
+
+    if sandbox.started_at:
+        data["started_at"] = iso_timestamp(sandbox.started_at)
+    if sandbox.terminated_at:
+        data["terminated_at"] = iso_timestamp(sandbox.terminated_at)
+    if sandbox.exit_code is not None:
+        data["exit_code"] = sandbox.exit_code
+    if sandbox.environment_vars:
+        data["environment_vars"] = obfuscate_env_vars(sandbox.environment_vars)
+    if sandbox.secrets:
+        data["secrets"] = obfuscate_secrets(sandbox.secrets)
+    if sandbox.advanced_configs:
+        advanced_configs = sandbox.advanced_configs.model_dump()
+        advanced_configs.pop("vmEgressPolicy", None)
+        if advanced_configs:
+            data["advanced_configs"] = advanced_configs
+
+    return data
+
+
+@app.command("list", epilog=LIST_SANDBOXES_JSON_HELP)
+def list_sandboxes_cmd(
+    team_id: Optional[str] = typer.Option(
+        None, help="Filter by team ID (uses config team_id if not specified)"
+    ),
+    status: Optional[str] = typer.Option(None, help="Filter by status"),
+    labels: Optional[List[str]] = typer.Option(
+        None,
+        "--label",
+        "-l",
+        help="Filter by labels (can specify multiple, sandboxes must have ALL)",
+    ),
+    num: int = typer.Option(50, "--num", "-n", help="Items per page"),
+    cursor: Optional[str] = typer.Option(
+        None,
+        "--cursor",
+        help="Opaque pagination cursor from a previous response's next_cursor",
+    ),
+    all: bool = typer.Option(False, "--all", help="Show all sandboxes including terminated ones"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List your sandboxes (shortcut: ls)"""
+    validate_output_format(output, console)
+
+    if num < 1:
+        console.print("[red]Error:[/red] --num must be at least 1")
+        raise typer.Exit(1)
+
+    try:
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        # Always exclude terminated sandboxes unless --all is specified or status filter is used
+        exclude_terminated = not all and status is None
+
+        sandbox_list = sandbox_client.list(
+            team_id=team_id,
+            status=status,
+            labels=labels,
+            per_page=num,
+            cursor=cursor,
+            exclude_terminated=exclude_terminated,
+        )
+
+        total_label = str(sandbox_list.total) if sandbox_list.total is not None else "?"
+        table = build_table(
+            f"Sandboxes (Total: {total_label})",
+            [
+                ("ID", "cyan"),
+                ("Name", "blue"),
+                ("Image", "green"),
+                ("Status", "yellow"),
+                ("Resources", "magenta"),
+                ("Labels", "white"),
+                ("Age", "blue"),
+                ("Expires", "yellow"),
+            ],
+        )
+
+        # Sort sandboxes by created_at (oldest first)
+        sorted_sandboxes = sort_by_created(sandbox_list.sandboxes)
+
+        if output == "json":
+            # Output as JSON with timestamp (for automation)
+            sandboxes_data = []
+            for sandbox in sorted_sandboxes:
+                sandbox_data = _format_sandbox_for_list(sandbox)
+                # For JSON, use timestamp instead of age
+                json_sandbox = {
+                    "id": sandbox_data["id"],
+                    "name": sandbox_data["name"],
+                    "image": sandbox_data["image"],
+                    "status": sandbox_data["status"],
+                    "resources": sandbox_data["resources"],
+                    "region": sandbox_data["region"],
+                    "labels": sandbox_data["labels_list"],
+                    "created_at": sandbox_data["created_at"],
+                    "timeout_minutes": sandbox_data["timeout_minutes"],
+                    "expires_at": sandbox_data["expires_at"],
+                }
+                sandboxes_data.append(json_sandbox)
+
+            output_data = {
+                "sandboxes": sandboxes_data,
+                "total": sandbox_list.total,
+                "per_page": num,
+                "has_next": sandbox_list.has_next,
+                "next_cursor": sandbox_list.next_cursor,
+            }
+            output_data_as_json(output_data, console)
+        else:
+            # Output as table using shared formatting
+            for sandbox in sorted_sandboxes:
+                sandbox_data = _format_sandbox_for_list(sandbox)
+
+                color = status_color(sandbox_data["status"], SANDBOX_STATUS_COLORS)
+
+                table.add_row(
+                    sandbox_data["id"],
+                    sandbox_data["name"],
+                    sandbox_data["image"],
+                    Text(sandbox_data["status"], style=color),
+                    sandbox_data["resources"],
+                    sandbox_data["labels"],
+                    sandbox_data["age"],
+                    sandbox_data["expires"],
+                )
+
+            console.print(table)
+
+            if sandbox_list.has_next and sandbox_list.next_cursor:
+                console.print(
+                    f"\n[yellow]Use --cursor {sandbox_list.next_cursor} to see more.[/yellow]"
+                )
+
+    except typer.Exit:
+        raise
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+@app.command(no_args_is_help=True, epilog=SANDBOX_DETAIL_JSON_HELP)
+def get(
+    sandbox_id: str,
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Get detailed information about a specific sandbox"""
+    validate_output_format(output, console)
+
+    try:
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        sandbox = sandbox_client.get(sandbox_id)
+
+        if output == "json":
+            # Output as JSON using shared formatting
+            sandbox_data = _format_sandbox_for_details(sandbox)
+            output_data_as_json(sandbox_data, console)
+        else:
+            # Output as table using shared formatting
+            sandbox_data = _format_sandbox_for_details(sandbox)
+
+            table = Table(title=f"Sandbox Details: {sandbox_id}")
+            table.add_column("Property", style="cyan")
+            table.add_column("Value", style="white")
+
+            table.add_row("ID", sandbox_data["id"])
+            table.add_row("Name", sandbox_data["name"])
+            table.add_row("Type", sandbox_data["type"])
+            table.add_row("Docker Image", sandbox_data["docker_image"])
+            table.add_row("Start Command", _format_start_command(sandbox.start_command))
+
+            sandbox_status_color = status_color(sandbox_data["status"], SANDBOX_STATUS_COLORS)
+            table.add_row("Status", Text(sandbox_data["status"], style=sandbox_status_color))
+
+            table.add_row("CPU Cores", str(sandbox_data["cpu_cores"]))
+            table.add_row("Memory (GB)", str(sandbox_data["memory_gb"]))
+            table.add_row("Disk Size (GB)", str(sandbox_data["disk_size_gb"]))
+            table.add_row("Disk Mount Path", sandbox_data["disk_mount_path"])
+            table.add_row("GPU Count", str(sandbox_data["gpu_count"]))
+            table.add_row("GPU Type", sandbox_data.get("gpu_type") or "N/A")
+            table.add_row(
+                "Network Access",
+                _network_access_description(
+                    sandbox_data.get("network_allowlist"),
+                    sandbox_data.get("network_denylist"),
+                ),
+            )
+            table.add_row("Timeout (minutes)", str(sandbox_data["timeout_minutes"]))
+            if sandbox_data.get("idle_timeout_minutes") is not None:
+                table.add_row("Idle Timeout (minutes)", str(sandbox_data["idle_timeout_minutes"]))
+            if sandbox_data.get("termination_reason"):
+                table.add_row("Termination Reason", sandbox_data["termination_reason"])
+
+            # Show labels
+            labels_display = ", ".join(sandbox_data["labels"]) if sandbox_data["labels"] else "None"
+            table.add_row("Labels", labels_display)
+
+            table.add_row("Created", sandbox_data["created_at"])
+            if "started_at" in sandbox_data:
+                table.add_row("Started", sandbox_data["started_at"])
+            if "terminated_at" in sandbox_data:
+                table.add_row("Terminated", sandbox_data["terminated_at"])
+            if "exit_code" in sandbox_data:
+                table.add_row("Exit Code", str(sandbox_data["exit_code"]))
+
+            table.add_row("User ID", sandbox_data["user_id"] or "N/A")
+            table.add_row("Team ID", sandbox_data["team_id"] or "Personal")
+            if sandbox_data.get("region"):
+                table.add_row("Region", sandbox_data["region"])
+
+            if "environment_vars" in sandbox_data:
+                env_vars = json.dumps(sandbox_data["environment_vars"], indent=2)
+                table.add_row("Environment Variables", env_vars)
+
+            if "secrets" in sandbox_data:
+                secrets = json.dumps(sandbox_data["secrets"], indent=2)
+                table.add_row("Secrets", secrets)
+
+            if "advanced_configs" in sandbox_data:
+                advanced_configs = json.dumps(sandbox_data["advanced_configs"], indent=2)
+                table.add_row("Advanced Configs", advanced_configs)
+
+            console.print(table)
+
+    except typer.Exit:
+        raise
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+class _NetworkGroup(DefaultCommandGroup):
+    """``network SANDBOX_ID [--allow|--deny]`` keeps meaning ``network egress``."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, default_cmd_name="egress", **kwargs)
+
+
+network_app = PlainTyper(
+    cls=_NetworkGroup,
+    help="Manage sandbox egress rules and private LAN networks between VM sandboxes",
+    no_args_is_help=True,
+)
+app.add_typer(network_app, name="network")
+
+
+def _parse_lan_rule(raw: str) -> LanRule:
+    """Parse ``FROM->TO[@PORT,PORT]``, e.g. ``tag:web->tag:db@5432`` or ``*->*``."""
+    head, sep, ports = raw.partition("@")
+    src, arrow, dst = head.partition("->")
+    if not arrow or not src.strip() or not dst.strip():
+        raise ValueError(f"invalid rule {raw!r}: expected FROM->TO[@PORT,...]")
+    if sep and not ports.strip():
+        raise ValueError(f"invalid rule {raw!r}: '@' needs at least one port")
+    try:
+        port_list = [int(p) for p in ports.split(",")] if sep else None
+    except ValueError as exc:
+        raise ValueError(f"invalid ports in rule {raw!r}") from exc
+    return LanRule(from_=src.strip(), to=dst.strip(), ports=port_list)
+
+
+def _lan_rule_text(rule: LanRule) -> str:
+    ports = "@" + ",".join(str(p) for p in rule.ports) if rule.ports else ""
+    return f"{rule.from_}->{rule.to}{ports}"
+
+
+def _print_lan_network(network: LanNetwork, output: str) -> None:
+    if output == "json":
+        output_data_as_json(network.model_dump(mode="json", by_alias=True), console)
+        return
+    console.print(f"Network: [cyan]{escape(network.id)}[/cyan] ({escape(network.name)})")
+    console.print(f"Rules: {escape(', '.join(_lan_rule_text(r) for r in network.rules) or 'none')}")
+    if not network.synced:
+        console.print("[yellow]⚠ Not synced to the VM fleet yet. Retrying automatically.[/yellow]")
+    if network.members is None:
+        return
+    if not network.members:
+        console.print("No members.")
+        return
+    table = build_table(
+        "Members",
+        [("Sandbox", "cyan"), ("Address", "white"), ("Tags", "white"), ("Synced", "white")],
+    )
+    for m in network.members:
+        table.add_row(
+            escape(m.sandbox_id),
+            f"{escape(m.sandbox_id)}.sandbox.internal",
+            escape(", ".join(m.tags)),
+            "yes" if m.synced else "no",
+        )
+    console.print(table)
+
+
+def _lan_error(exc: Exception) -> None:
+    console.print(f"[red]Error:[/red] {escape(str(exc))}")
+    raise typer.Exit(1) from exc
+
+
+@network_app.command("create", no_args_is_help=True)
+def lan_create(
+    name: str,
+    team_id: Optional[str] = typer.Option(None, "--team-id", help="Create the network for a team"),
+    rule: Optional[List[str]] = typer.Option(
+        None,
+        "--rule",
+        "-r",
+        help="Allow rule FROM->TO[@PORT,...] with selectors '*' or 'tag:NAME', "
+        "e.g. 'tag:web->tag:db@5432', in force before any member joins. Repeatable.",
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Create a network. Without --rule, it starts with the platform's default rules:
+    none, so no member reaches another (older platforms let every member reach every
+    other)."""
+    validate_output_format(output, console)
+    try:
+        rules = [_parse_lan_rule(r) for r in rule] if rule else None
+        network = SandboxClient(APIClient()).create_lan_network(name, team_id, rules=rules)
+        _print_lan_network(network, output)
+    except (ValueError, APIError) as exc:
+        _lan_error(exc)
+
+
+@network_app.command("list")
+def lan_list(
+    team_id: Optional[str] = typer.Option(None, "--team-id", help="List a team's networks"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List your LAN networks."""
+    validate_output_format(output, console)
+    try:
+        networks = SandboxClient(APIClient()).list_lan_networks(team_id)
+    except APIError as exc:
+        _lan_error(exc)
+    if output == "json":
+        output_data_as_json(
+            {"networks": [n.model_dump(mode="json", by_alias=True) for n in networks]}, console
+        )
+        return
+    if not networks:
+        console.print("No LAN networks found.")
+        return
+    table = build_table(
+        "LAN networks", [("ID", "cyan"), ("Name", "white"), ("Rules", "white"), ("Age", "white")]
+    )
+    for n in networks:
+        table.add_row(
+            escape(n.id),
+            escape(n.name),
+            escape(", ".join(_lan_rule_text(r) for r in n.rules)),
+            human_age(n.created_at),
+        )
+    console.print(table)
+
+
+@network_app.command("get", no_args_is_help=True)
+def lan_get(
+    network_id: str,
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Show a network with its rules and members."""
+    validate_output_format(output, console)
+    try:
+        _print_lan_network(SandboxClient(APIClient()).get_lan_network(network_id), output)
+    except APIError as exc:
+        _lan_error(exc)
+
+
+@network_app.command("delete", no_args_is_help=True)
+def lan_delete(
+    network_id: str,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Delete a network; its members stop reaching each other through it."""
+    if not confirm_or_skip(f"Delete LAN network {network_id}?", yes):
+        raise typer.Exit(0)
+    try:
+        SandboxClient(APIClient()).delete_lan_network(network_id)
+    except APIError as exc:
+        _lan_error(exc)
+    console.print(f"Deleted LAN network {escape(network_id)}")
+
+
+@network_app.command("add", no_args_is_help=True)
+def lan_add(
+    network_id: str,
+    sandbox_id: str,
+    tag: Optional[List[str]] = typer.Option(None, "--tag", "-t", help="Member tag (repeatable)"),
+) -> None:
+    """Add a running VM sandbox to a network, or replace its tags."""
+    try:
+        member = SandboxClient(APIClient()).add_lan_member(network_id, sandbox_id, tag)
+    except APIError as exc:
+        _lan_error(exc)
+    console.print(
+        f"Added {escape(member.sandbox_id)} as {escape(member.sandbox_id)}.sandbox.internal"
+        + (f" with tags {escape(', '.join(member.tags))}" if member.tags else "")
+    )
+
+
+@network_app.command("remove", no_args_is_help=True)
+def lan_remove(network_id: str, sandbox_id: str) -> None:
+    """Remove a sandbox from a network."""
+    try:
+        SandboxClient(APIClient()).remove_lan_member(network_id, sandbox_id)
+    except APIError as exc:
+        _lan_error(exc)
+    console.print(f"Removed {escape(sandbox_id)} from {escape(network_id)}")
+
+
+@network_app.command("rules", no_args_is_help=True)
+def lan_rules(
+    network_id: str,
+    rule: List[str] = typer.Option(
+        ...,
+        "--rule",
+        "-r",
+        help="Allow rule FROM->TO[@PORT,...] with selectors '*' or 'tag:NAME', "
+        "e.g. 'tag:web->tag:db@5432'. FROM 'internet' exposes the listed ports "
+        "at https://<port>-<sandbox-id>.<gateway domain>, e.g. "
+        "'internet->tag:web@8080'. Repeatable; replaces all rules.",
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Replace a network's rules. Rules are directed and allow-only."""
+    validate_output_format(output, console)
+    try:
+        rules = [_parse_lan_rule(r) for r in rule]
+        _print_lan_network(SandboxClient(APIClient()).set_lan_rules(network_id, rules), output)
+    except (ValueError, APIError) as exc:
+        _lan_error(exc)
+
+
+def _parse_localhost_forward(raw: str) -> LocalhostForward:
+    """Parse ``PORT:PEER_SANDBOX_ID``, e.g. ``5432:sbx-db``."""
+    port, sep, peer = raw.partition(":")
+    if not sep or not port.strip().isdigit() or not peer.strip():
+        raise ValueError(f"invalid forward {raw!r}: expected PORT:PEER_SANDBOX_ID")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError(f"invalid forward {raw!r}: port must be 1-65535")
+    return LocalhostForward(port=int(port), sandbox_id=peer.strip())
+
+
+def _print_localhost_forwards(forwards: List[LocalhostForward], output: str) -> None:
+    if output == "json":
+        output_data_as_json({"forwards": [f.model_dump() for f in forwards]}, console)
+        return
+    if not forwards:
+        console.print("No localhost forwards.")
+    for f in forwards:
+        console.print(f"localhost:{f.port} -> {escape(f.sandbox_id)}.sandbox.internal:{f.port}")
+
+
+@network_app.command("localhost", no_args_is_help=True)
+def localhost_forwards(
+    sandbox_id: str,
+    forward: Optional[List[str]] = typer.Argument(
+        None,
+        help="PORT:PEER_SANDBOX_ID, e.g. 5432:sbx-db makes localhost:5432 reach "
+        "sbx-db's port 5432. Replaces all forwards.",
+        show_default=False,
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove all localhost forwards"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Show or replace the localhost forwards of a VM sandbox. Each forward makes the
+    sandbox's own 127.0.0.1:PORT and [::1]:PORT reach PEER.sandbox.internal:PORT. The
+    peer must share a LAN network whose rules allow PORT, or connections are reset."""
+    validate_output_format(output, console)
+    try:
+        if clear and forward:
+            raise ValueError("provide forwards or --clear, not both")
+        client = SandboxClient(APIClient())
+        if clear or forward:
+            forwards = [_parse_localhost_forward(f) for f in forward or []]
+            ports = [f.port for f in forwards]
+            if len(ports) != len(set(ports)):
+                raise ValueError("each port can be forwarded only once")
+            current = client.set_localhost_forwards(sandbox_id, forwards)
+        else:
+            current = client.get_localhost_forwards(sandbox_id)
+        _print_localhost_forwards(current, output)
+    except (ValueError, APIError) as exc:
+        _lan_error(exc)
+
+
+checkpoint_app = PlainTyper(help="Manage filesystem checkpoints", no_args_is_help=True)
+app.add_typer(checkpoint_app, name="checkpoint")
+app.add_typer(sandbox_volumes_app, name="volumes")
+
+
+def _print_checkpoint(checkpoint: SandboxCheckpoint, output: str) -> None:
+    if output == "json":
+        output_data_as_json(checkpoint.model_dump(mode="json"), console)
+        return
+    console.print(f"Checkpoint ID: [cyan]{escape(checkpoint.id)}[/cyan]")
+    console.print(f"State: {escape(checkpoint.state)}")
+    if checkpoint.error:
+        console.print(f"Error: {escape(checkpoint.error)}")
+    elif checkpoint.state != "DURABLE":
+        console.print(
+            "Restorable once DURABLE. Check with "
+            f"'prime sandbox checkpoint list {escape(checkpoint.sandbox_id)}'."
+        )
+
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration(value: str) -> int:
+    """'90', '30m', '12h' or '7d' as seconds."""
+    raw = value.strip().lower()
+    unit = _DURATION_UNITS.get(raw[-1:], None)
+    number = raw[:-1] if unit else raw
+    if not number.isdigit() or int(number) <= 0:
+        raise typer.BadParameter(f"invalid duration {value!r}; use e.g. 30m, 12h, 7d")
+    return int(number) * (unit or 1)
+
+
+@checkpoint_app.command("create")
+def checkpoint_create(
+    sandbox_id: str,
+    ttl: Optional[str] = typer.Option(
+        None, "--ttl", help="Delete the checkpoint after this long, e.g. 12h or 7d"
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Request a filesystem checkpoint of a running sandbox."""
+    validate_output_format(output, console)
+    ttl_seconds = _parse_duration(ttl) if ttl else None
+    try:
+        result = SandboxClient(APIClient()).checkpoint(sandbox_id, ttl_seconds=ttl_seconds)
+        _print_checkpoint(result, output)
+    except APIError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+
+@checkpoint_app.command("list")
+def checkpoint_list(
+    sandbox_id: Optional[str] = typer.Argument(
+        None, help="Sandbox ID; omit to list every checkpoint of your account or team"
+    ),
+    checkpoint_id: Optional[str] = typer.Option(
+        None, "--checkpoint-id", help="Show only this checkpoint"
+    ),
+    team_id: Optional[str] = typer.Option(
+        None, "--team-id", help="Team ID (uses config team_id if omitted)"
+    ),
+    state: Optional[List[str]] = typer.Option(
+        None, "--state", help="Only this state (repeatable), e.g. DURABLE or FAILED"
+    ),
+    older_than: Optional[str] = typer.Option(
+        None, "--older-than", help="Only checkpoints older than this, e.g. 7d"
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List checkpoints of one sandbox, or of your whole account (incl. deleted sandboxes)."""
+    validate_output_format(output, console)
+    if checkpoint_id and (not sandbox_id or state or older_than):
+        console.print(
+            "[red]Error:[/red] --checkpoint-id needs a sandbox ID and no --state/--older-than; "
+            "use 'prime sandbox checkpoint get ID' to look one up."
+        )
+        raise typer.Exit(1)
+    client = SandboxClient(APIClient())
+    try:
+        if sandbox_id and not (state or older_than):
+            results = client.list_checkpoints(sandbox_id, checkpoint_id)
+        else:
+            results = client.list_all_checkpoints(
+                team_id=team_id or client.client.config.team_id,
+                sandbox_id=sandbox_id,
+                states=[s.upper() for s in state] if state else None,
+                created_before=_older_than(older_than),
+            )
+    except APIError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    if output == "json":
+        output_data_as_json({"checkpoints": [c.model_dump(mode="json") for c in results]}, console)
+        return
+    if not results:
+        console.print("No checkpoints found.")
+        return
+    # One sandbox: show lineage (Parent); account-wide: which sandbox it came from.
+    # Expires only when some checkpoint has a TTL, to keep the table narrow.
+    show_expiry = any(c.expires_at for c in results)
+    table = build_table(
+        f"Checkpoints: {escape(sandbox_id or 'all sandboxes')}",
+        [
+            ("ID", "cyan"),
+            ("Parent" if sandbox_id else "Sandbox", "white"),
+            ("State", "white"),
+            ("Depth", "white"),
+            # Size is the quota measure (occupied bytes); Stored is the
+            # compressed billing metric — they differ by design.
+            ("Size", "white"),
+            ("Stored", "white"),
+            ("Age", "white"),
+            *([("Expires", "white")] if show_expiry else []),
+            ("Error", "red"),
+        ],
+    )
+    for c in results:
+        expiry = [c.expires_at.strftime("%Y-%m-%d %H:%M UTC") if c.expires_at else "-"]
+        table.add_row(
+            escape(c.id),
+            escape((c.parent_id or "-") if sandbox_id else c.sandbox_id),
+            escape(c.state),
+            str(c.depth),
+            f"{c.occupied_bytes / 1024**2:.1f} MiB",
+            f"{c.stored_bytes / 1024**2:.1f} MiB" if c.stored_bytes is not None else "-",
+            human_age(c.created_at),
+            *(expiry if show_expiry else []),
+            escape(c.error or ""),
+        )
+    console.print(table)
+
+
+def _older_than(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    return datetime.now(timezone.utc) - timedelta(seconds=_parse_duration(value))
+
+
+@checkpoint_app.command("get")
+def checkpoint_get(
+    checkpoint_id: str,
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Show one checkpoint's state by ID, rootfs or volume."""
+    validate_output_format(output, console)
+    try:
+        checkpoint = SandboxClient(APIClient()).get_checkpoint(checkpoint_id)
+    except APIError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    if output == "json":
+        output_data_as_json(checkpoint.model_dump(mode="json"), console)
+        return
+    # Neutral output: a checkpoint fetched by id may be a volume checkpoint,
+    # which is never restorable as a sandbox rootfs, so no restorable hint.
+    console.print(f"Checkpoint ID: [cyan]{escape(checkpoint.id)}[/cyan]")
+    console.print(f"State: {escape(checkpoint.state)}")
+    console.print(f"Size: {checkpoint.occupied_bytes / 1024**2:.1f} MiB")
+    if checkpoint.error:
+        console.print(f"Error: {escape(checkpoint.error)}")
+
+
+@checkpoint_app.command("delete", no_args_is_help=True)
+def checkpoint_delete(
+    checkpoint_ids: Optional[List[str]] = typer.Argument(
+        None, help="Checkpoint ID(s) to delete (space or comma-separated)"
+    ),
+    sandbox_id: Optional[str] = typer.Option(
+        None, "--sandbox", "-s", help="Delete every checkpoint of this sandbox"
+    ),
+    delete_all: bool = typer.Option(
+        False,
+        "--all",
+        help="Delete every checkpoint of your account or team (incl. deleted sandboxes)",
+    ),
+    team_id: Optional[str] = typer.Option(
+        None, "--team-id", help="With --all: team ID (uses config team_id if omitted)"
+    ),
+    state: Optional[List[str]] = typer.Option(
+        None, "--state", help="With --all: only DURABLE or FAILED (repeatable)"
+    ),
+    older_than: Optional[str] = typer.Option(
+        None, "--older-than", help="With --all: only checkpoints older than this, e.g. 7d"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Delete checkpoints by ID, all of a sandbox's with --sandbox, or all with --all.
+
+    Deleting stops storage billing. Data is kept while descendant checkpoints
+    still need it, without charges.
+    """
+    validate_output_format(output, console)
+    if sum((bool(checkpoint_ids), bool(sandbox_id) and not delete_all, delete_all)) != 1:
+        console.print("[red]Error:[/red] Pass checkpoint IDs, --sandbox, or --all.")
+        raise typer.Exit(1)
+    parts = (s.strip() for arg in checkpoint_ids or [] for s in arg.split(","))
+    ids = [i for i in dict.fromkeys(parts) if i]
+    client = SandboxClient(APIClient())
+    resolved_team = team_id or client.client.config.team_id
+    if delete_all:
+        scope = f"team {resolved_team}" if resolved_team else "your personal account"
+        filters = "".join(
+            [
+                f" of sandbox {sandbox_id}" if sandbox_id else "",
+                f" in state {', '.join(state)}" if state else "",
+                f" older than {older_than}" if older_than else "",
+            ]
+        )
+        target = f"ALL checkpoints{filters} in {scope}"
+    elif sandbox_id:
+        target = f"all checkpoints of sandbox {sandbox_id}"
+    else:
+        target = f"{len(ids)} checkpoint(s)"
+    if not confirm_or_skip(f"Delete {target}?", yes):
+        return
+    deleted: List[str] = []
+    errors: List[Dict[str, str]] = []
+    try:
+        if delete_all:
+            result = client.delete_all_checkpoints(
+                team_id=resolved_team,
+                sandbox_id=sandbox_id,
+                states=[s.upper() for s in state] if state else None,
+                created_before=_older_than(older_than),
+            )
+            deleted = result.deleted
+            errors = [e.model_dump() for e in result.errors]
+        elif sandbox_id:
+            result = client.delete_sandbox_checkpoints(sandbox_id)
+            deleted = result.deleted
+            errors = [e.model_dump() for e in result.errors]
+    except APIError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    for checkpoint_id in ids:
+        try:
+            client.delete_checkpoint(checkpoint_id)
+            deleted.append(checkpoint_id)
+        except APIError as exc:
+            errors.append({"checkpoint_id": checkpoint_id, "message": str(exc)})
+    if output == "json":
+        output_data_as_json({"deleted": deleted, "errors": errors}, console)
+    else:
+        for checkpoint_id in deleted:
+            console.print(f"[green]Deleted checkpoint {escape(checkpoint_id)}[/green]")
+        for error in errors:
+            console.print(
+                f"[red]Failed to delete {escape(error['checkpoint_id'])}:[/red] "
+                f"{escape(error['message'])}"
+            )
+        if not deleted and not errors:
+            console.print("No checkpoints to delete.")
+    if errors:
+        raise typer.Exit(1)
+
+
+@checkpoint_app.command("restore")
+def checkpoint_restore(
+    checkpoint_id: str,
+    name: Optional[str] = typer.Option(None, help="Name for the new sandbox"),
+    team_id: Optional[str] = typer.Option(None, help="Team ID (uses config team_id if omitted)"),
+    cpu_cores: float = typer.Option(1.0, help="Number of CPU cores"),
+    memory_gb: float = typer.Option(1.0, help="Memory in GB"),
+    timeout_minutes: int = typer.Option(60, help="Timeout in minutes"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Create a new sandbox from a durable filesystem checkpoint."""
+    sandbox_name = name or f"restore-{checkpoint_id[:8]}"
+    try:
+        request = CreateSandboxRequest(
+            name=sandbox_name,
+            checkpoint_id=checkpoint_id,
+            team_id=team_id,
+            cpu_cores=cpu_cores,
+            memory_gb=memory_gb,
+            timeout_minutes=timeout_minutes,
+        )
+        if not confirm_or_skip(
+            f"Create sandbox {sandbox_name} from checkpoint {checkpoint_id}?", yes, default=True
+        ):
+            return
+        with console.status("[bold blue]Restoring sandbox...", spinner="dots"):
+            sandbox = SandboxClient(APIClient()).create(request)
+        console.print(f"[green]Successfully created sandbox {escape(sandbox.id)}[/green]")
+        console.print(f"Use 'prime sandbox get {escape(sandbox.id)}' to check its status")
+    except APIError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+
+@app.command("fork")
+def fork(
+    sandbox_id: str,
+    name: Optional[str] = typer.Option(None, help="Name for the new sandbox"),
+    cpu_cores: Optional[float] = typer.Option(None, help="CPU cores (default: source's)"),
+    memory_gb: Optional[float] = typer.Option(None, help="Memory in GB (default: source's)"),
+    timeout_minutes: Optional[int] = typer.Option(
+        None, help="Timeout in minutes (default: source's)"
+    ),
+    wait_timeout: float = typer.Option(300, help="Seconds to wait for the fork to be ready"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Fork a running sandbox into a new sandbox with the same filesystem."""
+    client = SandboxClient(APIClient())
+    try:
+        source = client.get(sandbox_id)
+        sandbox_name = name or f"{source.name}-fork"
+        prompt = f"Fork sandbox {sandbox_id} into {sandbox_name}?"
+        if not confirm_or_skip(prompt, yes, default=True):
+            return
+        with console.status("[bold blue]Forking sandbox...", spinner="dots"):
+            checkpoint = client.checkpoint(sandbox_id)
+            try:
+                checkpoint = client.wait_for_checkpoint(checkpoint.id, timeout_seconds=wait_timeout)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"Fork of {sandbox_id} was not ready within {wait_timeout:g}s"
+                ) from exc
+            except RuntimeError as exc:
+                raise RuntimeError(f"Fork of {sandbox_id} failed") from exc
+        request = CreateSandboxRequest(
+            name=sandbox_name,
+            checkpoint_id=checkpoint.id,
+            team_id=source.team_id,
+            region=source.region,
+            cpu_cores=cpu_cores if cpu_cores is not None else source.cpu_cores,
+            memory_gb=memory_gb if memory_gb is not None else source.memory_gb,
+            gpu_count=source.gpu_count,
+            gpu_type=source.gpu_type,
+            timeout_minutes=(
+                timeout_minutes if timeout_minutes is not None else source.timeout_minutes
+            ),
+            labels=source.labels,
+        )
+        with console.status("[bold blue]Forking sandbox...", spinner="dots"):
+            sandbox = client.create(request)
+        console.print(f"[green]Successfully forked into sandbox {escape(sandbox.id)}[/green]")
+        console.print(f"Use 'prime sandbox get {escape(sandbox.id)}' to check its status")
+    except (APIError, ValueError, RuntimeError, TimeoutError) as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+
+@app.command(cls=_SandboxCreateCommand)
+def create(
+    docker_image: Optional[str] = typer.Argument(
+        None,
+        help=(
+            "VM image reference to run. Defaults to python:3.11-slim. "
+            "To omit the image when supplying a command, use '-- COMMAND...'."
+        ),
+    ),
+    command: Optional[List[str]] = typer.Argument(
+        None,
+        help=(
+            "Executable and arguments to start. Use '--' before the executable "
+            "when its arguments begin with '-'."
+        ),
+        metavar="[COMMAND]...",
+    ),
+    name: Optional[str] = typer.Option(
+        None, help="Name for the sandbox (auto-generated if not provided)"
+    ),
+    cpu_cores: float = typer.Option(1.0, help="Number of CPU cores"),
+    memory_gb: float = typer.Option(1.0, help="Memory in GB"),
+    disk_size_gb: float = typer.Option(5.0, help="Disk size in GB"),
+    gpu_count: int = typer.Option(0, help="Number of GPUs"),
+    arch: str = typer.Option(
+        "amd64", "--arch", help="VM architecture: amd64, arm64, or arm (alias)"
+    ),
+    gpu_type: Optional[str] = typer.Option(
+        None,
+        "--gpu-type",
+        help="GPU type/model (e.g. RTX_PRO_6000, H200_141GB). Required when --gpu-count > 0",
+    ),
+    # Hidden for compatibility: VM is the only runtime. The SDK's create()
+    # always sends vm=true on the wire.
+    vm: Optional[bool] = typer.Option(None, "--vm", hidden=True),
+    network_allow: Optional[List[str]] = typer.Option(
+        None,
+        "--network-allow",
+        help=(
+            "Repeatable. Allow egress only to these domains/IPv4 CIDRs "
+            "(hostname-aware), optionally with :port or :low-high (domains: 80 or 443). "
+            "Mutually exclusive with --network-deny."
+        ),
+    ),
+    network_deny: Optional[List[str]] = typer.Option(
+        None,
+        "--network-deny",
+        help=(
+            "Repeatable. Deny egress to these domains/IPv4 CIDRs, optionally with "
+            ":port or :low-high (domains: 80 or 443), and allow everything else. "
+            "Mutually exclusive with --network-allow."
+        ),
+    ),
+    # List[Any] boundary annotation: typer rejects list-of-tuple annotations;
+    # click owns the two-argument arity through click_type.
+    inject_header: Optional[List[Any]] = typer.Option(
+        None,
+        "--inject-header",
+        click_type=click.Tuple([str, str]),
+        help=(
+            "Repeatable. Set an HTTPS request header for egress to a host, e.g. "
+            "--inject-header api.example.com 'Authorization: Bearer "
+            "${prime.secrets.OPENAI_KEY}'. A '*.' host matches exactly one label. "
+            "Secret references resolve on the sandbox's node, never inside the sandbox."
+        ),
+    ),
+    network_policy: Optional[str] = typer.Option(
+        None,
+        "--network-policy",
+        help=(
+            "JSON file with the egress policy: optional 'allow' and 'deny' "
+            "destination lists (exactly one, as with the flags) and 'rules' "
+            "mapping hosts to headers."
+        ),
+    ),
+    timeout_minutes: int = typer.Option(60, help="Timeout in minutes"),
+    idle_timeout_minutes: Optional[int] = typer.Option(
+        None,
+        "--idle-timeout-minutes",
+        help=(
+            "Terminate the sandbox if no /exec, /upload, /download, or "
+            "/read-file operation is active for this many minutes. Disabled by default."
+        ),
+    ),
+    team_id: Optional[str] = typer.Option(
+        None, help="Team ID (uses config team_id if not specified)"
+    ),
+    region: Optional[str] = typer.Option(
+        None,
+        "--region",
+        help="Sandbox cluster region (for example: us, eu-west). Uses backend default if omitted.",
+    ),
+    env: Optional[List[str]] = typer.Option(
+        None,
+        help="Environment variables in KEY=VALUE format. Can be specified multiple times.",
+    ),
+    secret: Optional[List[str]] = typer.Option(
+        None,
+        help="Secrets in KEY=VALUE format. Can be specified multiple times.",
+    ),
+    labels: Optional[List[str]] = typer.Option(
+        None,
+        "--label",
+        "-l",
+        help="Labels/tags for the sandbox. Can be specified multiple times.",
+    ),
+    volume: Optional[List[str]] = typer.Option(
+        None,
+        "--volume",
+        help="Attach a volume as NAME:/mount/path[:ro]. Can be specified multiple times.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Create a new sandbox"""
+    try:
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+        # Parse environment variables
+        env_vars = {}
+        if env:
+            for env_var in env:
+                if "=" not in env_var:
+                    console.print("[red]Environment variables must be in KEY=VALUE format[/red]")
+                    raise typer.Exit(1)
+                key, value = env_var.split("=", 1)
+                env_vars[key] = value
+
+        secrets_vars = {}
+        if secret:
+            for secret_var in secret:
+                if "=" not in secret_var:
+                    console.print("[red]Secrets must be in KEY=VALUE format[/red]")
+                    raise typer.Exit(1)
+                key, value = secret_var.split("=", 1)
+                secrets_vars[key] = value
+
+        volume_mounts: List[VolumeMount] = []
+        if volume:
+            volume_mounts = parse_volume_mount_specs(volume)
+
+        # VM is the only runtime. The hidden --vm flag stays accepted for
+        # compatibility, and the resolved value is always sent so the created
+        # runtime never depends on server-side defaults changing underneath a
+        # deployed CLI.
+        runtime_defaulted = vm is None
+
+        if gpu_count > 0 and not gpu_type:
+            console.print(
+                "[red]GPU type is required when requesting GPUs.[/red] "
+                "Provide --gpu-type with --gpu-count > 0."
+            )
+            raise typer.Exit(1)
+
+        if arch == "arm":
+            arch = "arm64"
+        if arch not in ("amd64", "arm64"):
+            console.print("[red]Error: --arch must be amd64, arm64, or arm[/red]")
+            raise typer.Exit(1)
+
+        if gpu_count == 0 and gpu_type:
+            console.print(
+                "[red]GPU type provided without GPUs.[/red] "
+                "Set --gpu-count > 0 when using --gpu-type."
+            )
+            raise typer.Exit(1)
+
+        if idle_timeout_minutes is not None:
+            if idle_timeout_minutes < 1:
+                console.print("[red]--idle-timeout-minutes must be at least 1.[/red]")
+                raise typer.Exit(1)
+            elif timeout_minutes > 0 and idle_timeout_minutes > timeout_minutes:
+                console.print(
+                    "[red]--idle-timeout-minutes must be <= --timeout-minutes "
+                    f"(got idle={idle_timeout_minutes}, lifetime={timeout_minutes}).[/red]"
+                )
+                raise typer.Exit(1)
+
+        docker_image = docker_image or _DEFAULT_SANDBOX_IMAGE
+
+        # Auto-generate name if not provided
+        if not name:
+            if gpu_count > 0 and gpu_type:
+                gpu_slug = "".join(c if c.isalnum() or c == "-" else "-" for c in gpu_type.lower())
+                base_name = f"gpu-{'-'.join(filter(None, gpu_slug.split('-')))}"
+            else:
+                image_parts = docker_image.split("/")[-1].split(":")[0]
+                image_slug = "".join(
+                    c if c.isalnum() or c == "-" else "-" for c in image_parts.lower()
+                )
+                base_name = f"vm-{'-'.join(filter(None, image_slug.split('-')))}"
+
+            suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+            name = f"{base_name}-{suffix}"
+
+        # Only forward idle_timeout_minutes if the installed prime-sandboxes
+        # SDK actually defines the field; older wheels would silently drop it
+        # via Pydantic's extra="ignore" default, hiding the misconfiguration
+        # from the user. SDK version floor is bumped in a follow-up release PR.
+        request_kwargs: Dict[str, Any] = {}
+        if idle_timeout_minutes is not None:
+            if "idle_timeout_minutes" in CreateSandboxRequest.model_fields:
+                request_kwargs["idle_timeout_minutes"] = idle_timeout_minutes
+            else:
+                console.print(
+                    "[yellow]Warning:[/yellow] installed prime-sandboxes SDK "
+                    "does not support --idle-timeout-minutes; ignoring."
+                )
+
+        # Reject conflicting flags locally before any API request.
+        if network_allow is not None and network_deny is not None:
+            console.print(
+                "[red]Error:[/red] --network-allow and --network-deny are mutually exclusive"
+            )
+            raise typer.Exit(1)
+
+        try:
+            network_allow, network_deny, network_rules = _resolve_network_policy_lists(
+                allow=network_allow,
+                deny=network_deny,
+                inject_header=inject_header,
+                network_policy=network_policy,
+                require_destinations=False,
+            )
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] {escape(str(exc))}")
+            raise typer.Exit(1)
+
+        if network_rules is not None:
+            request_kwargs["network_rules"] = network_rules
+
+        resolved_start_command: StartCommand | None
+        if command:
+            resolved_start_command = StartCommand(
+                executable=command[0],
+                args=command[1:],
+            )
+        else:
+            resolved_start_command = None
+
+        request = CreateSandboxRequest(
+            name=name,
+            docker_image=docker_image,
+            arch="arm64" if arch == "arm64" else "amd64",
+            start_command=resolved_start_command,
+            cpu_cores=cpu_cores,
+            memory_gb=memory_gb,
+            disk_size_gb=disk_size_gb,
+            gpu_count=gpu_count,
+            gpu_type=gpu_type,
+            network_allowlist=network_allow,
+            network_denylist=network_deny,
+            timeout_minutes=timeout_minutes,
+            environment_vars=env_vars if env_vars else None,
+            secrets=secrets_vars if secrets_vars else None,
+            labels=labels if labels else [],
+            team_id=team_id,
+            region=region,
+            volumes=volume_mounts if volume_mounts else None,
+            **request_kwargs,
+        )
+
+        # Show configuration summary
+        console.print("\n[bold]Sandbox Configuration:[/bold]")
+        console.print(f"Name: {name}")
+        console.print(f"Docker Image: {docker_image}")
+        console.print(f"Architecture: {arch}")
+        console.print(f"Start Command: {_format_start_command(resolved_start_command)}")
+        console.print(f"Resources: {cpu_cores} CPU, {memory_gb}GB RAM, {disk_size_gb}GB disk")
+        runtime_label = "VM (default)" if runtime_defaulted else "VM"
+        console.print(f"Runtime: {runtime_label}")
+        if gpu_count > 0:
+            console.print(f"GPUs: {gpu_type} x{gpu_count}")
+        if network_allow is not None:
+            console.print(
+                f"Egress Allowlist: {', '.join(network_allow) if network_allow else '(deny all)'}"
+            )
+        elif network_deny is not None:
+            console.print(
+                f"Egress Denylist: {', '.join(network_deny) if network_deny else '(allow all)'}"
+            )
+        if network_rules:
+            rules_summary = ", ".join(
+                f"{host}: {len(rule.headers)} header(s)"
+                for host, rule in sorted(network_rules.items())
+            )
+            console.print(f"Header Rules: {rules_summary}")
+        console.print(f"Timeout: {timeout_minutes} minutes")
+        # Only show the idle timeout in the summary when the SDK actually
+        # accepted it; otherwise we'd display a value the backend never sees.
+        if idle_timeout_minutes is not None and "idle_timeout_minutes" in request_kwargs:
+            console.print(f"Idle Timeout: {idle_timeout_minutes} minutes")
+        # SandboxClient.create auto-populates the request's team from
+        # config (env > file) when the flag is absent; mirror it here.
+        resolved_team_id = team_id or base_client.config.team_id
+        console.print(f"Team: {resolved_team_id or 'Personal'}")
+        console.print(f"Region: {region or 'Backend default'}")
+        if volume_mounts:
+            mounts_summary = ", ".join(
+                f"{m.name}:{m.mount_path}" + (" (ro)" if m.read_only else "") for m in volume_mounts
+            )
+            console.print(f"Volumes: {mounts_summary}")
+        if labels:
+            console.print(f"Labels: {', '.join(labels)}")
+        if env_vars:
+            obfuscated_env = obfuscate_env_vars(env_vars)
+            console.print(f"Environment Variables: {obfuscated_env}")
+        if secrets_vars:
+            obfuscated_secrets = obfuscate_secrets(secrets_vars)
+            console.print(f"Secrets: {obfuscated_secrets}")
+
+        if confirm_or_skip("\nDo you want to create this sandbox?", yes, default=True):
+            with console.status("[bold blue]Creating sandbox...", spinner="dots"):
+                sandbox = sandbox_client.create(request)
+
+            console.print(f"\n[green]Successfully created sandbox {sandbox.id}[/green]")
+            if getattr(sandbox, "pending_image_build_id", None):
+                console.print(
+                    "[yellow]First VM use of this image: a VM image is being "
+                    "built automatically. The sandbox stays PENDING and starts "
+                    "on its own once the build completes (this can take "
+                    "several minutes).[/yellow]"
+                )
+            console.print(
+                f"[blue]Use 'prime sandbox get {sandbox.id}' to check the sandbox status[/blue]"
+            )
+        else:
+            console.print("\nSandbox creation cancelled")
+            return
+
+    except typer.Exit:
+        raise
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except ValidationError as e:
+        console.print(f"[red]Error:[/red] {escape(_validation_error_message(e))}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+def _validation_error_message(exc: ValidationError) -> str:
+    """Summarize a request validation error without its input values, which
+    can carry --secret values and header templates."""
+    messages = []
+    for error in exc.errors():
+        message = error["msg"].removeprefix("Value error, ")
+        location = ".".join(str(part) for part in error["loc"])
+        messages.append(f"{location}: {message}" if location else message)
+    return "; ".join(messages)
+
+
+def _preview_bulk_delete_count(
+    sandbox_client: SandboxClient,
+    team_id: Optional[str],
+    user_id: Optional[str],
+    labels: Optional[List[str]],
+) -> Optional[int]:
+    """Fetch the total number of sandboxes matching the scope, cheaply.
+
+    Uses a single list(per_page=1) call and reads the total field.
+    Returns None on API error so the caller can still proceed (server will
+    re-evaluate the filter on delete).
+    """
+    try:
+        response = sandbox_client.list(
+            per_page=1,
+            team_id=team_id,
+            user_id=user_id,
+            labels=labels or None,
+            exclude_terminated=True,
+        )
+    except APIError:
+        return None
+    return response.total
+
+
+def _display_bulk_delete_result(result: BulkDeleteSandboxResponse) -> None:
+    """Pretty-print a single bulk_delete response."""
+    total = len(result.succeeded) + len(result.failed)
+    console.print(f"\n[green]Processed {total} sandbox(es)[/green]")
+
+    if result.succeeded:
+        console.print(
+            f"\n[bold green]Successfully deleted {len(result.succeeded)} sandbox(es):[/bold green]"
+        )
+        for sid in result.succeeded:
+            console.print(f"  ✓ {sid}")
+
+    if result.failed:
+        console.print(f"\n[bold red]Failed to delete {len(result.failed)} sandbox(es):[/bold red]")
+        for failure in result.failed:
+            sid = failure.get("sandbox_id", "unknown")
+            error = failure.get("error", "unknown error")
+            console.print(f"  ✗ {sid}: {error}")
+
+
+def _bulk_delete_and_display(
+    sandbox_client: SandboxClient,
+    sandbox_ids: List[str],
+) -> None:
+    """Batch-delete explicit sandbox IDs (up to 500 per request) and print results."""
+    batch_size = 100
+    all_succeeded: List[str] = []
+    all_failed: List[Dict[str, Any]] = []
+
+    with console.status("[bold blue]Deleting sandboxes...", spinner="dots"):
+        for i in range(0, len(sandbox_ids), batch_size):
+            batch = sandbox_ids[i : i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(sandbox_ids) + batch_size - 1) // batch_size
+
+            if total_batches > 1:
+                console.print(
+                    f"[dim]Processing batch {batch_num}/"
+                    f"{total_batches} "
+                    f"({len(batch)} sandboxes)...[/dim]"
+                )
+
+            result: BulkDeleteSandboxResponse = sandbox_client.bulk_delete(sandbox_ids=batch)
+
+            if result.succeeded:
+                all_succeeded.extend(result.succeeded)
+            if result.failed:
+                all_failed.extend(result.failed)
+
+    _display_bulk_delete_result(
+        BulkDeleteSandboxResponse(
+            succeeded=all_succeeded,
+            failed=all_failed,
+            message="",
+        )
+    )
+
+
+@app.command(no_args_is_help=True)
+def delete(
+    sandbox_ids: Optional[List[str]] = typer.Argument(
+        None, help="Sandbox ID(s) to delete (space or comma-separated)"
+    ),
+    all: bool = typer.Option(False, "--all", "-a", help="Delete all sandboxes"),
+    labels: Optional[List[str]] = typer.Option(
+        None, "--label", "-l", help="Delete all sandboxes with ALL these labels"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    only_mine: bool = typer.Option(
+        True,
+        "--only-mine/--all-users",
+        "-m/-A",
+        help=(
+            "Restrict '--all' and '--label' deletes to your own sandboxes."
+            " --all-users deletes across every user in the team and requires"
+            " team admin role."
+        ),
+        show_default=True,
+    ),
+    target_user_id: Optional[str] = typer.Option(
+        None,
+        "--user",
+        "-u",
+        help=(
+            "Scope '--all' and '--label' deletes to this teammate's sandboxes."
+            " Requires team admin role and a configured team_id. Cannot be"
+            " combined with --all-users."
+        ),
+    ),
+) -> None:
+    """Delete one or more sandboxes by ID, by label, or all sandboxes with --all
+
+    '--all' and '--label' perform a single server-side scoped delete: by
+    default it is scoped to your own sandboxes in the configured team.
+    Pass '--all-users' to delete across the whole team (team admin only), or
+    '--user <user_id>' to target a single teammate's sandboxes (team admin only).
+    """
+    try:
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        if sum([bool(all), bool(sandbox_ids), bool(labels)]) > 1:
+            console.print(
+                "[red]Error:[/red] Cannot specify more than one of: sandbox IDs, --all, or --label"
+            )
+            raise typer.Exit(1)
+
+        if not all and not sandbox_ids and not labels:
+            console.print(
+                "[red]Error:[/red] Must specify either sandbox IDs, --all flag, or --label"
+            )
+            raise typer.Exit(1)
+
+        if target_user_id and not (all or labels):
+            console.print(
+                "[red]Error:[/red] --user only applies to --all or --label deletes."
+                " To delete specific sandbox IDs owned by a teammate, pass the"
+                " IDs directly (team admins can already delete any sandbox in"
+                " their team by ID)."
+            )
+            raise typer.Exit(1)
+
+        if all or labels:
+            config = Config()
+            team_id = config.team_id
+
+            if target_user_id and not only_mine:
+                console.print(
+                    "[red]Error:[/red] Cannot combine --user with --all-users."
+                    " Use one or the other."
+                )
+                raise typer.Exit(1)
+
+            if target_user_id:
+                if not team_id:
+                    console.print(
+                        "[red]Error:[/red] --user requires a team_id."
+                        " Configure one with 'prime config set-team-id <id>'."
+                    )
+                    raise typer.Exit(1)
+                scope_user_id = target_user_id
+                all_users_flag = False
+            elif only_mine:
+                scope_user_id = config.user_id
+                all_users_flag = False
+                if not scope_user_id:
+                    console.print(
+                        "[red]Error:[/red] Cannot scope to your sandboxes -"
+                        " no user_id configured. Use --all-users to delete"
+                        " sandboxes across the team (requires team admin), or"
+                        " configure your user_id."
+                    )
+                    raise typer.Exit(1)
+            else:
+                scope_user_id = None
+                all_users_flag = True
+
+            total = _preview_bulk_delete_count(
+                sandbox_client,
+                team_id=team_id,
+                user_id=scope_user_id,
+                labels=labels,
+            )
+
+            if total == 0:
+                console.print("[yellow]No sandboxes to delete[/yellow]")
+                if target_user_id:
+                    console.print(
+                        f"\n[dim]Note: no active sandboxes for user"
+                        f" {target_user_id} in this team.[/dim]"
+                    )
+                elif only_mine:
+                    console.print(
+                        "\n[dim]Note: --all/--label only deletes your own"
+                        " sandboxes by default. Use --all-users to delete"
+                        " sandboxes from all team members, or --user <id> to"
+                        " target a specific teammate (both require team"
+                        " admin).[/dim]"
+                    )
+                return
+
+            if target_user_id:
+                scope_suffix = f" for user {target_user_id}"
+            elif only_mine:
+                scope_suffix = ""
+            else:
+                scope_suffix = " across ALL users"
+            if labels:
+                labels_str = ", ".join(labels)
+                count_phrase = (
+                    f"{total} sandbox(es)" if total is not None else "all matching sandboxes"
+                )
+                confirmation_msg = (
+                    f"Are you sure you want to delete {count_phrase}"
+                    f" with labels: {labels_str}{scope_suffix}? This action"
+                    " cannot be undone."
+                )
+                cancel_msg = "Delete cancelled"
+            else:
+                count_phrase = (
+                    f"ALL {total} sandbox(es)" if total is not None else "EVERY matching sandbox"
+                )
+                confirmation_msg = (
+                    f"Are you sure you want to delete {count_phrase}"
+                    f"{scope_suffix}? This action cannot be undone."
+                )
+                cancel_msg = "Delete all cancelled"
+
+            if not confirm_or_skip(confirmation_msg, yes):
+                console.print(cancel_msg)
+                return
+
+            with console.status("[bold blue]Deleting sandboxes...", spinner="dots"):
+                result: BulkDeleteSandboxResponse = sandbox_client.bulk_delete(
+                    team_id=team_id,
+                    user_id=scope_user_id,
+                    all_users=all_users_flag,
+                    labels=labels or None,
+                )
+
+            _display_bulk_delete_result(result)
+            return
+
+        parsed_ids = []
+        for id_string in sandbox_ids or []:
+            if "," in id_string:
+                parsed_ids.extend([id.strip() for id in id_string.split(",") if id.strip()])
+            else:
+                parsed_ids.append(id_string.strip())
+
+        cleaned_ids = []
+        seen = set()
+        for id in parsed_ids:
+            if id and id not in seen:
+                cleaned_ids.append(id)
+                seen.add(id)
+        sandbox_ids = cleaned_ids
+
+        if len(sandbox_ids) == 1:
+            sandbox_id = sandbox_ids[0]
+            if not confirm_or_skip(f"Are you sure you want to delete sandbox {sandbox_id}?", yes):
+                console.print("Delete cancelled")
+                return
+
+            with console.status("[bold blue]Deleting sandbox...", spinner="dots"):
+                sandbox_client.delete(sandbox_id)
+
+            console.print(f"[green]Successfully deleted sandbox {sandbox_id}[/green]")
+            return
+
+        confirmation_msg = f"Are you sure you want to delete {len(sandbox_ids)} sandbox(es)?"
+        if not confirm_or_skip(confirmation_msg, yes):
+            console.print("Bulk delete cancelled")
+            return
+
+        _bulk_delete_and_display(sandbox_client, sandbox_ids)
+
+    except typer.Exit:
+        raise
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+@network_app.command("egress", no_args_is_help=True)
+def network(
+    sandbox_id: str,
+    allow: Optional[str] = typer.Option(
+        None,
+        "--allow",
+        help=(
+            "Replace the allowed destinations with a comma-separated list of "
+            "domains/IPv4 CIDRs, optionally with :port or :low-high (domains: 80 or 443). "
+            "Use '*' to allow all. Required together with header rules."
+        ),
+    ),
+    deny: Optional[str] = typer.Option(
+        None,
+        "--deny",
+        help=(
+            "Replace the denied destinations with a comma-separated list of "
+            "domains/IPv4 CIDRs, optionally with :port or :low-high (domains: 80 or 443). "
+            "Use '*' to deny all. Required together with header rules."
+        ),
+    ),
+    # List[Any] boundary annotation: typer rejects list-of-tuple annotations;
+    # click owns the two-argument arity through click_type.
+    inject_header: Optional[List[Any]] = typer.Option(
+        None,
+        "--inject-header",
+        click_type=click.Tuple([str, str]),
+        help=(
+            "Repeatable. Set an HTTPS request header for egress to a host, e.g. "
+            "--inject-header api.example.com 'Authorization: Bearer "
+            "${prime.secrets.OPENAI_KEY}'. A '*.' host matches exactly one label. "
+            "Secret references resolve on the sandbox's node, never inside the sandbox."
+        ),
+    ),
+    network_policy: Optional[str] = typer.Option(
+        None,
+        "--network-policy",
+        help=(
+            "JSON file with the complete egress policy: optional 'allow' and "
+            "'deny' destination lists (exactly one) and 'rules' mapping hosts "
+            "to headers."
+        ),
+    ),
+) -> None:
+    """Show or replace the egress rules of a VM sandbox (default subcommand)."""
+    try:
+        allow_entries, deny_entries, rules = _resolve_network_policy_lists(
+            allow=_parse_network_destinations(allow, "--allow") if allow is not None else None,
+            deny=_parse_network_destinations(deny, "--deny") if deny is not None else None,
+            inject_header=inject_header,
+            network_policy=network_policy,
+            require_destinations=True,
+        )
+
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        if allow_entries is None and deny_entries is None:
+            with console.status("[bold blue]Fetching network rules...", spinner="dots"):
+                status = sandbox_client.get_network(sandbox_id)
+        else:
+            with console.status("[bold blue]Updating network rules...", spinner="dots"):
+                status = sandbox_client.set_network(
+                    sandbox_id, allow=allow_entries, deny=deny_entries, rules=rules
+                )
+
+        _print_network_status(
+            sandbox_id, status, updated=allow_entries is not None or deny_entries is not None
+        )
+        if not status.applied:
+            console.print(
+                "[yellow]⚠ Network rules were saved but are not active yet. "
+                "Retrying automatically.[/yellow]"
+            )
+
+    except typer.Exit:
+        raise
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        raise typer.Exit(1)
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        raise typer.Exit(1)
+
+
+def _resolve_network_policy_lists(
+    *,
+    allow: Optional[List[str]],
+    deny: Optional[List[str]],
+    inject_header: Optional[List[Any]],
+    network_policy: Optional[str],
+    require_destinations: bool,
+) -> Tuple[Optional[List[str]], Optional[List[str]], Optional[Dict[str, HeaderRule]]]:
+    """Merge destination flags and --network-policy into one egress policy.
+
+    The policy is always a complete replacement, never a merge: flag and file
+    allow/deny selections conflict instead of combining, and header rules
+    combine only within themselves (file rules plus --inject-header entries).
+    With ``require_destinations`` (the live replace command), header rules must
+    travel with an explicit allow/deny selection.
+    """
+    if allow is not None and deny is not None:
+        raise ValueError("provide at most one of --allow and --deny")
+
+    policy_file: Dict[str, Any] = {}
+    if network_policy is not None:
+        policy_file = _load_network_policy_file(network_policy)
+        if policy_file.get("allow") is not None and policy_file.get("deny") is not None:
+            raise ValueError(f"{network_policy}: provide at most one of allow and deny")
+
+    file_allow = policy_file.get("allow")
+    file_deny = policy_file.get("deny")
+    if allow is not None and file_allow is not None:
+        raise ValueError("provide at most one of --allow and --network-policy allow")
+    if deny is not None and file_deny is not None:
+        raise ValueError("provide at most one of --deny and --network-policy deny")
+    if network_policy is not None and not (
+        file_allow is not None or file_deny is not None or policy_file.get("rules")
+    ):
+        raise ValueError(f"{network_policy}: must contain at least one of allow, deny, rules")
+
+    allow_list = allow if allow is not None else file_allow
+    deny_list = deny if deny is not None else file_deny
+    if allow_list is not None and not isinstance(allow_list, list):
+        raise ValueError(f"{network_policy}: allow must be a list of destinations")
+    if deny_list is not None and not isinstance(deny_list, list):
+        raise ValueError(f"{network_policy}: deny must be a list of destinations")
+
+    rules: Optional[Dict[str, HeaderRule]] = None
+    file_rules = policy_file.get("rules")
+    inject_rules = _parse_header_injections(inject_header or [])
+    if file_rules is not None and not isinstance(file_rules, dict):
+        raise ValueError(f"{network_policy}: rules must map hosts to headers")
+    if file_rules or inject_rules:
+        try:
+            rules = {
+                host: HeaderRule.model_validate(rule) for host, rule in (file_rules or {}).items()
+            }
+        except ValidationError as exc:
+            raise ValueError(f"{network_policy}: {_validation_error_message(exc)}") from None
+        for host, rule in inject_rules.items():
+            if host in rules:
+                raise ValueError(f"--inject-header for {host!r} also set in --network-policy")
+            rules[host] = rule
+    if require_destinations and rules is not None and allow_list is None and deny_list is None:
+        raise ValueError(
+            "the egress replacement is complete: pass --allow or --deny "
+            "(or --network-policy carrying them) alongside the header rules"
+        )
+    return allow_list, deny_list, rules
+
+
+def _parse_header_injections(entries: Optional[List[Any]]) -> Dict[str, HeaderRule]:
+    """Build header substitution rules from repeatable
+    ``--inject-header HOST 'Name: value'`` flags.
+
+    Repeated flags for one host merge their headers; a duplicate header name
+    for the same host is an error rather than a silent override.
+    """
+    rules: Dict[str, HeaderRule] = {}
+    for host, header in entries or []:
+        name, separator, value = header.partition(":")
+        if not separator or not name.strip():
+            raise ValueError(f"--inject-header for {host!r} expects 'Name: value'")
+        rule = rules.setdefault(host, HeaderRule(headers={}))
+        header_name = name.strip()
+        if header_name in rule.headers:
+            raise ValueError(f"--inject-header for {host!r}: header {header_name!r} set twice")
+        rule.headers[header_name] = value.strip()
+    return rules
+
+
+def _load_network_policy_file(path: str) -> Dict[str, Any]:
+    """Load ``--network-policy``: a JSON object with optional ``allow``,
+    ``deny``, and ``rules`` keys, describing the complete egress policy."""
+    file = Path(path)
+    if not file.is_file():
+        raise ValueError(f"--network-policy: no such file: {path}")
+    try:
+        data = json.loads(file.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}:{exc.lineno}: invalid JSON: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: the network policy must be a JSON object")
+    unknown = sorted(set(data) - {"allow", "deny", "rules"})
+    if unknown:
+        raise ValueError(f"{path}: unknown network policy keys: {', '.join(unknown)}")
+    return data
+
+
+def _parse_network_destinations(value: str, option: str) -> List[str]:
+    entries = [entry.strip() for entry in value.split(",")]
+    if not entries or any(not entry for entry in entries):
+        raise ValueError(f"{option} requires a comma-separated list of destinations")
+    return entries
+
+
+def _network_policy_summary(status: "EgressPolicyStatus") -> tuple[str, str]:
+    if status.policy.allowlist is not None:
+        entries = status.policy.allowlist
+        if entries:
+            return "Access limited to", ", ".join(entries)
+        return "Internet access", "blocked"
+    elif status.policy.denylist is not None:
+        entries = status.policy.denylist
+        if entries:
+            return "Blocked", ", ".join(entries)
+    return "Internet access", "unrestricted"
+
+
+def _print_network_status(
+    sandbox_id: str,
+    status: "EgressPolicyStatus",
+    *,
+    updated: bool,
+) -> None:
+    if updated:
+        console.print("[green]✓[/green] Network access updated")
+    else:
+        console.print(f"[bold]Network access for {escape(sandbox_id)}[/bold]")
+
+    label, value = _network_policy_summary(status)
+    console.print(f"  [cyan]{label}:[/cyan] {escape(value)}")
+    rules = getattr(status.policy, "rules", None)
+    if rules:
+        summary = ", ".join(
+            f"{host}: {len(rule.headers)} header(s)" for host, rule in sorted(rules.items())
+        )
+        console.print(f"  [cyan]Header rules:[/cyan] {escape(summary)}")
+
+
+def _request_pause_or_resume(sandbox_id: str, resume: bool) -> None:
+    """Send a pause or resume request and report the accepted transition."""
+    try:
+        client = SandboxClient(APIClient())
+        sandbox = client.resume(sandbox_id) if resume else client.pause(sandbox_id)
+    except APIError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    target = "RUNNING" if resume else "PAUSED"
+    console.print(
+        f"{'Resume' if resume else 'Pause'} requested for [cyan]{escape(sandbox_id)}[/cyan] "
+        f"(status {escape(sandbox.status)}); it becomes {target} once the node finishes. "
+        f"Check with 'prime sandbox get {escape(sandbox_id)}'."
+    )
+
+
+@app.command(no_args_is_help=True)
+def pause(sandbox_id: str) -> None:
+    """Pause a running VM sandbox, keeping its memory and disk on its node."""
+    _request_pause_or_resume(sandbox_id, resume=False)
+
+
+@app.command(no_args_is_help=True)
+def resume(sandbox_id: str) -> None:
+    """Resume a paused VM sandbox on the node that holds it."""
+    _request_pause_or_resume(sandbox_id, resume=True)
+
+
+@app.command(no_args_is_help=True)
+def logs(sandbox_id: str) -> None:
+    """Get logs from a sandbox"""
+    try:
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        with console.status("[bold blue]Fetching logs...", spinner="dots"):
+            logs = sandbox_client.get_logs(sandbox_id)
+
+        if logs:
+            console.print(f"\n[bold]Logs for sandbox {sandbox_id}:[/bold]")
+            console.print(f"{escape(logs)}")
+        else:
+            console.print(f"[yellow]No logs available for sandbox {sandbox_id}[/yellow]")
+
+    except typer.Exit:
+        raise
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+@app.command(no_args_is_help=True)
+def run(
+    sandbox_id: str,
+    command: List[str] = typer.Argument(
+        ...,
+        help="Command to execute. Use -- before commands with options "
+        "(e.g., -- bash -c 'echo hello')",
+    ),
+    working_dir: Optional[str] = typer.Option(
+        None, "-w", "--working-dir", help="Working directory"
+    ),
+    env: Optional[List[str]] = typer.Option(
+        None,
+        "-e",
+        "--env",
+        help="Environment variables in KEY=VALUE format. Can be specified multiple times.",
+    ),
+    timeout: Optional[int] = typer.Option(
+        None,
+        "--timeout",
+        help="Timeout for the command in seconds",
+    ),
+    user: Optional[str] = typer.Option(
+        None, "-u", "--user", help="Existing guest username (default: sandbox's configured user)"
+    ),
+) -> None:
+    """Execute a command in a sandbox.
+
+    Use -- to separate sandbox run options from the command arguments when
+    the command has its own options (starting with -). Example:
+
+        prime sandbox run <id> -- bash -c "echo hello"
+    """
+    try:
+        if user is not None and "user" not in signature(SandboxClient.execute_command).parameters:
+            console.print(
+                "[red]The installed prime-sandboxes SDK does not support --user. "
+                "Upgrade prime-sandboxes to use this option.[/red]"
+            )
+            raise typer.Exit(1)
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        # Parse environment variables
+        env_vars = {}
+        if env:
+            for env_var in env:
+                if "=" not in env_var:
+                    console.print("[red]Environment variables must be in KEY=VALUE format[/red]")
+                    raise typer.Exit(1)
+                key, value = env_var.split("=", 1)
+                env_vars[key] = value
+
+        # Handle case where user passes entire command as a quoted string (e.g., "ls /home")
+        # We need to parse it properly to handle both:
+        # - "ls /home" -> should become: ls /home
+        # - "./my script.sh" -> should become: './my script.sh' (properly quoted)
+        if len(command) == 1:
+            # Parse the single string as shell tokens, then re-join properly
+            command_str = shlex.join(shlex.split(command[0]))
+        else:
+            command_str = shlex.join(command)
+
+        console.print(f"[bold blue]Executing command:[/bold blue] {command_str}")
+        if user is not None:
+            console.print(f"[bold blue]User:[/bold blue] {escape(user)}")
+        if working_dir:
+            console.print(f"[bold blue]Working directory:[/bold blue] {working_dir}")
+        if env_vars:
+            obfuscated_env = obfuscate_env_vars(env_vars)
+            console.print(f"[bold blue]Environment:[/bold blue] {obfuscated_env}")
+        if timeout is not None:
+            console.print(f"[bold blue]Timeout:[/bold blue] {timeout}s")
+
+        start_time = time.perf_counter()
+
+        with console.status("[bold blue]Running command...", spinner="dots"):
+            result = sandbox_client.execute_command(
+                sandbox_id,
+                command_str,
+                working_dir,
+                env_vars if env_vars else None,
+                timeout=timeout,
+                **({"user": user} if user is not None else {}),
+            )
+
+        # End timing
+        end_time = time.perf_counter()
+        execution_time_ms = (end_time - start_time) * 1000
+
+        # Display output
+        if result.stdout:
+            console.print("\n[bold green]stdout:[/bold green]")
+            console.print(result.stdout)
+
+        if result.stderr:
+            console.print("\n[bold red]stderr:[/bold red]")
+            console.print(result.stderr)
+
+        console.print(f"\n[dim]Execution time: {execution_time_ms:.1f}ms[/dim]")
+
+        if result.exit_code != 0:
+            console.print(f"\n[bold yellow]Exit code:[/bold yellow] {result.exit_code}")
+            raise typer.Exit(result.exit_code)
+
+    except typer.Exit:
+        raise
+    except SandboxNotRunningError as e:
+        console.print(f"[red]Sandbox Not Running:[/red] {str(e)}")
+        console.print(
+            f"[yellow]Tip:[/yellow] Check sandbox status with: prime sandbox get {sandbox_id}"
+        )
+        raise typer.Exit(1)
+    except CommandTimeoutError as e:
+        console.print(f"[red]Command Timeout:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+@app.command("upload", no_args_is_help=True)
+def upload_file(
+    sandbox_id: str = typer.Argument(..., help="Sandbox ID to upload file to"),
+    local_file: str = typer.Argument(..., help="Path to local file to upload"),
+    remote_path: str = typer.Argument(..., help="Path where file should be stored in sandbox"),
+) -> None:
+    """Upload a file to a sandbox"""
+    import os
+
+    try:
+        # Check if local file exists
+        if not os.path.exists(local_file):
+            console.print(f"[red]Error:[/red] Local file not found: {local_file}")
+            raise typer.Exit(1)
+
+        # Get file size for display
+        file_size = os.path.getsize(local_file)
+        filename = os.path.basename(local_file)
+
+        # If remote_path ends with '/', treat as directory
+        if remote_path.endswith("/"):
+            remote_path = remote_path.rstrip("/") + "/" + filename
+
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        console.print(f"[bold blue]Uploading file:[/bold blue] {filename}")
+        console.print(f"[bold blue]From:[/bold blue] {local_file}")
+        console.print(f"[bold blue]To:[/bold blue] {remote_path}")
+        console.print(f"[bold blue]Size:[/bold blue] {file_size:,} bytes")
+
+        with console.status("[bold blue]Uploading...", spinner="dots"):
+            response = sandbox_client.upload_file(
+                sandbox_id=sandbox_id, file_path=remote_path, local_file_path=local_file
+            )
+
+        console.print("[green]✓[/green] File uploaded successfully!")
+        console.print(f"[bold green]Remote path:[/bold green] {response.path}")
+        console.print(f"[bold green]Size:[/bold green] {response.size:,} bytes")
+        console.print(f"[bold green]Timestamp:[/bold green] {response.timestamp}")
+
+    except typer.Exit:
+        raise
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+@app.command("download", no_args_is_help=True)
+def download_file(
+    sandbox_id: str = typer.Argument(..., help="Sandbox ID to download file from"),
+    remote_path: str = typer.Argument(..., help="Path to file in sandbox"),
+    local_file: str = typer.Argument(..., help="Path where file should be saved locally"),
+) -> None:
+    """Download a file from a sandbox"""
+    import os
+
+    try:
+        # Check if local directory exists
+        local_dir = os.path.dirname(local_file)
+        if local_dir and not os.path.exists(local_dir):
+            console.print(f"[yellow]Warning:[/yellow] Creating directory: {local_dir}")
+            os.makedirs(local_dir, exist_ok=True)
+
+        # Check if local file already exists
+        if os.path.exists(local_file):
+            if not typer.confirm(f"File {local_file} already exists. Overwrite?"):
+                console.print("Download cancelled.")
+                return
+
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        console.print(f"[bold blue]Downloading file from sandbox:[/bold blue] {sandbox_id}")
+        console.print(f"[bold blue]From:[/bold blue] {remote_path}")
+        console.print(f"[bold blue]To:[/bold blue] {local_file}")
+
+        with console.status("[bold blue]Downloading...", spinner="dots"):
+            sandbox_client.download_file(
+                sandbox_id=sandbox_id, file_path=remote_path, local_file_path=local_file
+            )
+
+        # Get downloaded file size for display
+        file_size = os.path.getsize(local_file) if os.path.exists(local_file) else 0
+
+        console.print("[green]✓[/green] File downloaded successfully!")
+        console.print(f"[bold green]Local path:[/bold green] {local_file}")
+        console.print(f"[bold green]Size:[/bold green] {file_size:,} bytes")
+
+    except typer.Exit:
+        raise
+    except FileNotFoundError as e:
+        console.print(f"[red]File not found:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except UnauthorizedError as e:
+        console.print(f"[red]Unauthorized:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except PaymentRequiredError as e:
+        console.print(f"[red]Payment Required:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
+        console.print_exception(show_locals=False)
+        raise typer.Exit(1)
+
+
+@app.command("reset-cache")
+def reset_cache(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Reset sandbox authentication cache"""
+    if yes or typer.confirm("Are you sure you want to clear the sandbox auth cache?"):
+        try:
+            client = APIClient()
+            sandbox_client = SandboxClient(client)
+            sandbox_client.clear_auth_cache()
+            console.print("[green]Sandbox authentication cache cleared successfully![/green]")
+        except Exception as e:
+            console.print(f"[red]Error clearing cache: {e}[/red]")
+            raise typer.Exit(1)
+
+
+@app.command("ssh")
+def ssh_connect(
+    sandbox_id: str = typer.Argument(..., help="VM sandbox ID to SSH into"),
+    ssh_args: Optional[List[str]] = typer.Argument(
+        None, help="Additional SSH arguments (use -- before options)"
+    ),
+    shell: Optional[str] = typer.Option(None, "--shell", "-s", help="Remote shell to run"),
+) -> None:
+    """Connect to a VM sandbox with an ephemeral SSH key."""
+    try:
+        sandbox_client = SandboxClient(APIClient())
+        with ssh_transport(sandbox_client, sandbox_id) as transport:
+            command = [
+                "ssh",
+                f"{transport.user}@{transport.host}",
+                "-p",
+                str(transport.port),
+                "-i",
+                transport.key_path,
+                "-o",
+                f"ProxyCommand={transport.proxy_command}",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+            if shell:
+                command.append("-t")
+            if ssh_args:
+                command.extend(ssh_args)
+            if shell:
+                command.append(shell)
+
+            raise typer.Exit(subprocess.run(command).returncode)
+    except KeyboardInterrupt:
+        raise typer.Exit(130)
+    except APIError as error:
+        console.print(f"[red]Error:[/red] {error}")
+        raise typer.Exit(1)

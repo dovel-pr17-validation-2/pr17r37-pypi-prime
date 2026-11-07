@@ -1,0 +1,558 @@
+"""Tests for the egress policy SDK surface."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import httpx
+import pytest
+from pydantic import ValidationError
+
+from prime_sandboxes import APIError
+from prime_sandboxes.models import (
+    CreateSandboxRequest,
+    EgressPolicyStatus,
+    HeaderRule,
+    LocalhostForward,
+    Sandbox,
+    Secret,
+    validate_egress_lists,
+)
+from prime_sandboxes.sandbox import AsyncSandboxClient, SandboxClient
+
+
+def _policy_response():
+    return {
+        "policy": {"allowlist": None, "denylist": []},
+        "generation": 2,
+        "applied_generation": 2,
+        "applied": True,
+    }
+
+
+def _sync_client():
+    client = object.__new__(SandboxClient)
+    client.client = MagicMock()
+    client.client.request.return_value = _policy_response()
+    return client
+
+
+def _async_client():
+    client = object.__new__(AsyncSandboxClient)
+    client.client = SimpleNamespace(request=AsyncMock(return_value=_policy_response()))
+    return client
+
+
+class TestCreateSandboxRequestNetworkLists:
+    def test_removed_network_access_is_gone(self):
+        request = CreateSandboxRequest(name="t", docker_image="img")
+        assert "network_access" not in type(request).model_fields
+        assert "network_access" not in request.model_dump()
+
+    def test_lists_accepted_with_unset_vm(self):
+        request = CreateSandboxRequest(
+            name="t", docker_image="img", network_allowlist=["api.example.com"]
+        )
+        assert request.network_allowlist == ["api.example.com"]
+
+    def test_vm_allowlist_accepted(self):
+        request = CreateSandboxRequest(
+            name="t",
+            docker_image="img",
+            network_allowlist=["api.example.com", "1.2.3.4", "10.0.0.0/8"],
+        )
+        assert request.network_allowlist == ["api.example.com", "1.2.3.4", "10.0.0.0/8"]
+
+    def test_mutual_exclusion(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            CreateSandboxRequest(
+                name="t",
+                docker_image="img",
+                network_allowlist=["a.com"],
+                network_denylist=["b.com"],
+            )
+
+    def test_serializes_snake_case_and_keeps_empty_list(self):
+        request = CreateSandboxRequest(name="t", docker_image="img", network_allowlist=[])
+        payload = request.model_dump(by_alias=False, exclude_none=True)
+        assert payload["network_allowlist"] == []
+        assert "network_denylist" not in payload
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "*",
+            "https://example.com",
+            "example.com:22",
+            "example.com:80-443",
+            "1.2.3.4:0",
+            "1.2.3.4:65536",
+            "1.2.3.4:90-80",
+            "1.2.3.4:",
+            "1.2.3.4:ssh",
+            "*:443",
+            "2001:db8::/32:443",
+            "example.com?q=1",
+            "user@example.com",
+            "api.*.example.com",
+            "::1",
+            "2001:db8::/32",
+            "",
+        ],
+    )
+    def test_invalid_entries_rejected(self, entry):
+        with pytest.raises(ValidationError):
+            CreateSandboxRequest(name="t", docker_image="img", network_denylist=[entry])
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "203.0.113.10:22",
+            "10.0.0.0/8:8000-8100",
+            "0.0.0.0/0:25",
+            "example.com:443",
+            "*.example.com:80",
+        ],
+    )
+    def test_port_suffixes_accepted(self, entry):
+        CreateSandboxRequest(name="t", docker_image="img", network_denylist=[entry])
+
+
+@pytest.mark.parametrize("mode", ["allow", "deny"])
+def test_rule_count_cap(mode):
+    entries = [f"h{i}.example.com" for i in range(1024)]
+    field = f"network_{mode}list"
+    request = CreateSandboxRequest(name="t", docker_image="img", **{field: entries})
+    assert getattr(request, field) == entries
+
+    client = _sync_client()
+    client.set_network("sbx-1", **{mode: entries})
+    assert client.client.request.call_args.kwargs["json"][f"{mode}list"] == entries
+    client.client.request.reset_mock()
+
+    entries.append("overflow.example.com")
+    with pytest.raises(ValidationError, match="at most 1024 entries"):
+        CreateSandboxRequest(name="t", docker_image="img", **{field: entries})
+    with pytest.raises(ValueError, match="at most 1024 entries"):
+        client.set_network("sbx-1", **{mode: entries})
+    client.client.request.assert_not_called()
+
+
+class TestSandboxModel:
+    def test_network_access_removed_and_lists_parse(self):
+        assert "network_access" not in Sandbox.model_fields
+        sandbox = Sandbox.model_validate(
+            {
+                "id": "sbx-1",
+                "name": "t",
+                "dockerImage": "img",
+                "cpuCores": 1.0,
+                "memoryGB": 2.0,
+                "diskSizeGB": 10.0,
+                "diskMountPath": "/w",
+                "gpuCount": 0,
+                "vm": True,
+                "network_allowlist": ["api.example.com"],
+                "status": "RUNNING",
+                "timeoutMinutes": 60,
+                "createdAt": "2026-07-17T00:00:00Z",
+                "updatedAt": "2026-07-17T00:00:00Z",
+                # Old servers may still emit the removed boolean; it must be
+                # ignored rather than rejected.
+                "networkAccess": True,
+            }
+        )
+        assert sandbox.network_allowlist == ["api.example.com"]
+        assert sandbox.network_denylist is None
+
+
+class TestEgressPolicyStatus:
+    def test_parses_api_response(self):
+        status = EgressPolicyStatus.model_validate(
+            {
+                "policy": {"allowlist": ["api.example.com"], "denylist": None},
+                "generation": 3,
+                "applied_generation": 3,
+                "applied": True,
+            }
+        )
+        assert status.policy.allowlist == ["api.example.com"]
+        assert status.generation == 3
+        assert status.applied
+
+    def test_parses_unapplied_generation(self):
+        status = EgressPolicyStatus.model_validate(
+            {
+                "policy": {"allowlist": None, "denylist": []},
+                "generation": 0,
+                "applied_generation": -1,
+                "applied": False,
+            }
+        )
+
+        assert status.generation == 0
+        assert status.applied_generation == -1
+        assert not status.applied
+
+
+class TestSandboxNetworkMethods:
+    def test_get_network(self):
+        client = _sync_client()
+
+        status = client.get_network("sbx-1")
+
+        client.client.request.assert_called_once_with("GET", "/sandbox/sbx-1/egress-policy")
+        assert status.applied
+
+    @pytest.mark.parametrize(
+        ("kwargs", "payload"),
+        [
+            (
+                {"allow": ["api.example.com"]},
+                {"allowlist": ["api.example.com"], "denylist": None},
+            ),
+            (
+                {"deny": ["ads.example.com"]},
+                {"allowlist": None, "denylist": ["ads.example.com"]},
+            ),
+            ({"allow": ["*"]}, {"allowlist": None, "denylist": []}),
+            ({"deny": ["*"]}, {"allowlist": [], "denylist": None}),
+        ],
+    )
+    def test_set_network_maps_explicit_modes(self, kwargs, payload):
+        client = _sync_client()
+
+        status = client.set_network("sbx-1", **kwargs)
+
+        client.client.request.assert_called_once_with(
+            "PUT", "/sandbox/sbx-1/egress-policy", json=payload
+        )
+        assert status.applied
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({}, "exactly one"),
+            (
+                {"allow": ["api.example.com"], "deny": ["ads.example.com"]},
+                "exactly one",
+            ),
+            ({"allow": []}, "at least one destination"),
+            ({"deny": []}, "at least one destination"),
+            ({"allow": ["*", "api.example.com"]}, "only destination"),
+            ({"deny": ["ads.example.com", "*"]}, "only destination"),
+        ],
+    )
+    def test_set_network_rejects_invalid_replacements(self, kwargs, message):
+        client = _sync_client()
+
+        with pytest.raises(ValueError, match=message):
+            client.set_network("sbx-1", **kwargs)
+
+        client.client.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_methods_use_same_interface(self):
+        client = _async_client()
+
+        read_status = await client.get_network("sbx-1")
+        write_status = await client.set_network("sbx-1", allow=["api.example.com"])
+
+        assert read_status.applied
+        assert write_status.applied
+        assert client.client.request.await_args_list[0].args == (
+            "GET",
+            "/sandbox/sbx-1/egress-policy",
+        )
+        assert client.client.request.await_args_list[1].args == (
+            "PUT",
+            "/sandbox/sbx-1/egress-policy",
+        )
+        assert client.client.request.await_args_list[1].kwargs == {
+            "json": {"allowlist": ["api.example.com"], "denylist": None}
+        }
+
+
+class TestValidateEgressLists:
+    def test_empty_lists_are_valid(self):
+        validate_egress_lists([], None)
+        validate_egress_lists(None, [])
+
+    def test_both_none_is_valid(self):
+        validate_egress_lists(None, None)
+
+
+_AUTH = {"gateway_url": "https://gw/", "user_ns": "ns", "job_id": "job", "token": "tok"}
+_FORWARDS_URL = "https://gw/ns/job/network/local-forwards"
+
+
+def _gateway_response(status, method, **kwargs):
+    return httpx.Response(status, request=httpx.Request(method, _FORWARDS_URL), **kwargs)
+
+
+class TestLocalhostForwardsMethods:
+    def test_sync_set_posts_to_sandboxd(self):
+        client = object.__new__(SandboxClient)
+        client._auth_cache = MagicMock(get_or_refresh=MagicMock(return_value=_AUTH))
+        wire = {"forwards": [{"port": 8000, "peer_sandbox_id": "sbx-db"}]}
+        client._gateway_post = MagicMock(return_value=_gateway_response(200, "POST", json=wire))
+
+        forwards = client.set_localhost_forwards(
+            "sbx-1", [LocalhostForward(port=8000, sandbox_id="sbx-db")]
+        )
+
+        client._gateway_post.assert_called_once_with(
+            _FORWARDS_URL, headers={"Authorization": "Bearer tok"}, timeout=30, json=wire
+        )
+        assert forwards == [LocalhostForward(port=8000, sandbox_id="sbx-db")]
+
+    @pytest.mark.parametrize(
+        ("status", "message"), [(409, "port 8000 in use"), (404, "recreate the sandbox")]
+    )
+    def test_sync_errors_raise_api_error(self, status, message):
+        client = object.__new__(SandboxClient)
+        client._auth_cache = MagicMock(get_or_refresh=MagicMock(return_value=_AUTH))
+        client._gateway_get = MagicMock(
+            return_value=_gateway_response(status, "GET", text="port 8000 in use")
+        )
+
+        with pytest.raises(APIError, match=message):
+            client.get_localhost_forwards("sbx-1")
+
+    @pytest.mark.asyncio
+    async def test_async_get_reads_from_sandboxd(self):
+        client = object.__new__(AsyncSandboxClient)
+        client._auth_cache = SimpleNamespace(get_or_refresh=AsyncMock(return_value=_AUTH))
+        client._gateway_get = AsyncMock(
+            return_value=_gateway_response(200, "GET", json={"forwards": []})
+        )
+
+        assert await client.get_localhost_forwards("sbx-1") == []
+        assert client._gateway_get.await_args.args == (_FORWARDS_URL,)
+
+    def test_port_range_is_validated(self):
+        with pytest.raises(ValidationError):
+            LocalhostForward(port=0, sandbox_id="sbx-db")
+
+
+def _rules(**headers: str) -> dict:
+    return {"api.example.com": HeaderRule(headers=headers)}
+
+
+class TestHeaderRuleValidation:
+    def test_valid_rules_are_canonicalized(self):
+        request = CreateSandboxRequest(
+            name="t",
+            docker_image="img",
+            network_rules={"API.Example.COM": {"headers": {"X-Key": "v"}}},
+        )
+        assert set(request.network_rules) == {"api.example.com"}
+
+    def test_none_rules_stay_none(self):
+        request = CreateSandboxRequest(name="t", docker_image="img")
+        assert request.network_rules is None
+
+    def test_host_cap_enforced(self):
+        from prime_sandboxes.models import MAX_HEADER_RULE_HOSTS
+
+        rules = {
+            f"h{i}.example.com": {"headers": {"X": "v"}} for i in range(MAX_HEADER_RULE_HOSTS + 1)
+        }
+        with pytest.raises(ValidationError, match="at most"):
+            CreateSandboxRequest(name="t", docker_image="img", network_rules=rules)
+
+    def test_case_equivalent_hosts_rejected(self):
+        with pytest.raises(ValidationError, match="differ only by case"):
+            CreateSandboxRequest(
+                name="t",
+                docker_image="img",
+                network_rules={
+                    "api.example.com": {"headers": {"X": "v"}},
+                    "API.EXAMPLE.COM": {"headers": {"Y": "w"}},
+                },
+            )
+
+    def test_distinct_secret_cap_per_rule(self):
+        from prime_sandboxes.models import MAX_HEADER_RULE_SECRETS
+
+        def refs(count: int) -> str:
+            return "".join(f"${{prime.secrets.S{i}}}" for i in range(count))
+
+        # Repeats count once, and names are counted across all headers of the rule.
+        at_limit = _rules(
+            A=refs(MAX_HEADER_RULE_SECRETS - 1) + "${prime.secrets.S0}",
+            B="${prime.secrets.S9}",
+        )
+        CreateSandboxRequest(name="t", docker_image="img", network_rules=at_limit)
+
+        over_limit = _rules(A=refs(MAX_HEADER_RULE_SECRETS), B="${prime.secrets.EXTRA}")
+        with pytest.raises(ValidationError, match="distinct secrets"):
+            CreateSandboxRequest(name="t", docker_image="img", network_rules=over_limit)
+
+    def test_case_equivalent_header_names_rejected(self):
+        with pytest.raises(ValidationError, match="differ only by case"):
+            CreateSandboxRequest(
+                name="t",
+                docker_image="img",
+                network_rules=_rules(Authorization="a", authorization="b"),
+            )
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "",
+            "*",
+            "a.*.b.com",
+            "a.com:443",
+            "a.com/p",
+            "a b",
+            # IP literals are rejected (wildcard base included): the node
+            # refuses them, so they must never reach a stored policy.
+            "192.0.2.1",
+            "*.192.0.2.1",
+        ],
+    )
+    def test_invalid_hosts_rejected(self, host):
+        with pytest.raises(ValidationError):
+            CreateSandboxRequest(
+                name="t",
+                docker_image="img",
+                network_rules={host: {"headers": {"X": "v"}}},
+            )
+
+    @pytest.mark.parametrize("host", ["123.example.com", "example.com.456", "1.2.3.4.5"])
+    def test_numeric_dns_labels_accepted(self, host):
+        request = CreateSandboxRequest(
+            name="t",
+            docker_image="img",
+            network_rules={host: {"headers": {"X": "v"}}},
+        )
+        assert list(request.network_rules) == [host.lower()]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Host",
+            "host",
+            "Content-Length",
+            "transfer-encoding",
+            "Connection",
+            "Upgrade",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Proxy-Authorization",
+        ],
+    )
+    def test_reserved_headers_rejected(self, name):
+        with pytest.raises(ValidationError, match="reserved"):
+            CreateSandboxRequest(name="t", docker_image="img", network_rules=_rules(**{name: "v"}))
+
+    def test_crlf_value_rejected(self):
+        with pytest.raises(ValidationError, match="CR or LF"):
+            CreateSandboxRequest(
+                name="t",
+                docker_image="img",
+                network_rules=_rules(**{"X": "a\rb"}),
+            )
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("${foo}", "unsupported interpolation"),
+            ("${prime.secrets.OPENAI_KEY", "unterminated reference"),
+            ("${prime.secrets.openai_key}", "invalid secret name"),
+        ],
+    )
+    def test_invalid_references_rejected(self, value, message):
+        with pytest.raises(ValidationError, match=message):
+            CreateSandboxRequest(name="t", docker_image="img", network_rules=_rules(**{"X": value}))
+
+    def test_valid_reference_accepted(self):
+        request = CreateSandboxRequest(
+            name="t",
+            docker_image="img",
+            network_rules=_rules(Authorization="Bearer ${prime.secrets.OPENAI_KEY}"),
+        )
+        assert request.network_rules["api.example.com"].headers["Authorization"] == (
+            "Bearer ${prime.secrets.OPENAI_KEY}"
+        )
+
+
+class TestSecretFill:
+    def test_fill_returns_the_reference_string(self):
+        assert Secret.fill("OPENAI_KEY") == "${prime.secrets.OPENAI_KEY}"
+
+    def test_fill_rejects_invalid_names(self):
+        with pytest.raises(ValueError, match="invalid secret name"):
+            Secret.fill("openai-key")
+
+    def test_fill_composes_into_rules(self):
+        rules = _rules(Authorization=f"Bearer {Secret.fill('OPENAI_KEY')}")
+        request = CreateSandboxRequest(name="t", docker_image="img", network_rules=rules)
+        assert request.network_rules["api.example.com"].headers["Authorization"] == (
+            "Bearer ${prime.secrets.OPENAI_KEY}"
+        )
+
+
+class TestSetNetworkRules:
+    def test_rules_join_the_replacement_payload(self):
+        client = _sync_client()
+        rules = {
+            "API.Example.com": HeaderRule(
+                headers={"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}
+            )
+        }
+
+        status = client.set_network("sbx-1", allow=["*"], rules=rules)
+
+        payload = client.client.request.call_args.kwargs["json"]
+        assert payload["allowlist"] is None
+        assert payload["denylist"] == []
+        assert payload["rules"] == {
+            "api.example.com": {"headers": {"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}}
+        }
+        assert status.applied
+
+    def test_no_rules_keeps_the_previous_wire_shape(self):
+        client = _sync_client()
+
+        client.set_network("sbx-1", allow=["*"])
+
+        payload = client.client.request.call_args.kwargs["json"]
+        assert payload == {"allowlist": None, "denylist": []}
+
+    def test_invalid_rules_rejected_before_the_request(self):
+        client = _sync_client()
+
+        with pytest.raises(ValueError, match="reserved"):
+            client.set_network("sbx-1", allow=["*"], rules={"a.com": {"headers": {"Host": "x"}}})
+
+        client.client.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_set_network_carries_rules(self):
+        client = _async_client()
+        rules = {"a.com": HeaderRule(headers={"X-Key": "v"})}
+
+        status = await client.set_network("sbx-1", deny=["b.com"], rules=rules)
+
+        payload = client.client.request.await_args.kwargs["json"]
+        assert payload["rules"] == {"a.com": {"headers": {"X-Key": "v"}}}
+        assert status.applied
+
+
+class TestEgressPolicyStatusRules:
+    def test_parses_rules_from_the_status_response(self):
+        status = EgressPolicyStatus.model_validate(
+            {
+                "policy": {
+                    "allowlist": ["api.example.com"],
+                    "denylist": None,
+                    "rules": {"api.example.com": {"headers": {"X-Key": "v"}}},
+                },
+                "generation": 3,
+                "applied_generation": 3,
+                "applied": True,
+            }
+        )
+        assert status.policy.rules["api.example.com"].headers == {"X-Key": "v"}

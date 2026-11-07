@@ -1,0 +1,2730 @@
+"""Hosted Training commands."""
+
+import copy
+import json
+import re
+import time
+from contextlib import nullcontext
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import toml
+import typer
+from click.exceptions import Abort
+from rich.markup import escape as rich_escape
+from rich.padding import Padding
+from rich.table import Table
+from rich.text import Text
+
+from prime_cli.core import Config
+
+from ..api.rl import EnvServerInfo, RLClient, RLRun
+from ..api.training import (
+    HostedTrainingClient,
+    HostedTrainingRunResponse,
+    build_payload_from_toml,
+    resolve_pull_request_head,
+)
+from ..client import (
+    APIClient,
+    APIError,
+    APITimeoutError,
+    MethodNotAllowedError,
+    NotFoundError,
+    ServerError,
+)
+from ..utils import (
+    DefaultCommandGroup,
+    PlainTyper,
+    api_detail,
+    get_console,
+    json_help,
+    json_output_help,
+    output_data_as_json,
+    validate_output_format,
+)
+from ..utils.env_vars import EnvParseError, collect_env_vars
+from ..utils.formatters import format_file_size, strip_ansi
+from ..utils.prompt import confirm_or_skip
+from .feedback import submit_feedback
+from .usage import RUN_USAGE_JSON_HELP, run_usage_command
+
+console = get_console()
+
+RL_RUN_JSON_HELP = json_output_help(
+    ".run = {id, name?, status, base_model, environments[], "
+    "rollouts_per_example, max_steps, batch_size, gpu_count?, created_at, updated_at, ...}",
+)
+
+RL_DISPATCH_JSON_HELP = json_output_help(
+    ".run = {runId, sourceRef?, onDemand?, gpuType?, pricePerGpuHour?, "
+    "estimatedCostPerHour?, isBeta?}",
+)
+
+RL_MODELS_JSON_HELP = json_output_help(
+    ".available_fft_models[] = {name, clusters[{cluster_id, cluster_name, gpu_type?}]}",
+    ".on_demand[]? = {gpu_type, price_per_gpu_hour, available_now, discount_label?, is_beta}",
+    # available_now = the backend reports some free pool headroom for the
+    # GPU type; a run can still queue on GPU count/topology.
+    ".on_demand_beta_access? = true | false — known on-demand beta enrollment; "
+    "false means 'not enrolled', absent means the backend did not report it",
+)
+
+RL_LIST_JSON_HELP = json_output_help(
+    ".runs[] = {id, name?, status, base_model, environments[], max_steps, "
+    "batch_size, gpu_count?, created_at, updated_at, ...}",
+    ".total = number",
+    ".page = number",
+    ".per_page = number",
+)
+
+RL_METRICS_JSON_HELP = json_help(
+    ".metrics[] = metric record from the Hosted Training API",
+)
+
+RL_ROLLOUTS_JSON_HELP = json_help(
+    ". = {run_id, samples[], total, page, limit, total_pages}",
+)
+
+RL_PROGRESS_JSON_HELP = json_help(
+    ". = {latest_step, steps_with_samples[], steps_with_distributions[], last_updated_at}",
+)
+
+RL_DISTRIBUTIONS_JSON_HELP = json_help(
+    ". = {bins[], step}",
+)
+
+RL_CHECKPOINTS_JSON_HELP = json_output_help(
+    ".checkpoints[] = {id, rft_run_id, step, storage_url, status, "
+    "size_bytes?, created_at, uploaded_at?}",
+)
+
+
+# Progress bar pattern (tqdm-style progress bars)
+PROGRESS_BAR = re.compile(r".*\|[█▏▎▍▌▋▊▉ ]{10,}\|.*")
+
+HOSTED_TRAINING_LOG_STARTUP_POLL_SECONDS = 10
+HOSTED_TRAINING_LOG_STARTUP_POLLS = 18
+HOSTED_TRAINING_LOG_FOLLOW_POLL_SECONDS = 5
+
+HOSTED_TRAINING_STOP_POLL_SECONDS = 3
+HOSTED_TRAINING_STOP_MAX_POLLS = 60
+VOLUME_READY_POLL_SECONDS = 3
+VOLUME_READY_MAX_SECONDS = 180
+VOLUME_DEFAULT_SIZE = "5Ti"  # same default as `prime volumes create`
+
+TERMINAL_RUN_STATUSES = {"STOPPED", "FAILED", "COMPLETED", "PAUSED"}
+
+# Log level colors for rich console
+LEVEL_STYLES = {
+    "DEBUG": "dim",
+    "INFO": "",
+    "WARNING": "yellow",
+    "WARN": "yellow",
+    "ERROR": "red",
+    "CRITICAL": "red bold",
+    "SUCCESS": "green",
+}
+
+
+# Sentinel to indicate "this is JSON but should be skipped"
+_SKIP_LINE = "__SKIP__"
+
+# The API marks admin-visible infrastructure lines; torchrun and vLLM/Ray
+# can also prepend rank/process context before the JSON envelope.
+_LOG_PREFIX = re.compile(r"^(?:\[adminlog\]\s+|\[[a-zA-Z_]+\d+\]:\s*|\(\w+ pid=\d+\)\s+)")
+
+_MODEL_PARAM_COUNT_PATTERN = re.compile(
+    r"-(?P<total>\d+(?:\.\d)?)[bB](?:-[aA](?P<active>\d+(?:\.\d)?)[bB])?(?=$|-)"
+)
+
+
+def _model_name_sort_key(name: str) -> tuple[tuple[Any, ...], ...]:
+    """Sort model names lexically, with recognized billion-parameter counts numeric."""
+    segments: list[tuple[Any, ...]] = []
+    start = 0
+
+    for match in _MODEL_PARAM_COUNT_PATTERN.finditer(name):
+        if match.start() > start:
+            segments.append((0, name[start : match.start()]))
+
+        total_params = Decimal(match.group("total"))
+        active_params = Decimal(match.group("active") or match.group("total"))
+        segments.append((1, total_params, active_params))
+        start = match.end()
+
+    if start < len(name):
+        segments.append((0, name[start:]))
+
+    return tuple(segments)
+
+
+def format_json_log_line(line: str) -> str | None:
+    """Parse a JSON log line and format it for CLI display.
+
+    Returns:
+        - Formatted string for displayable JSON logs
+        - _SKIP_LINE sentinel for JSON logs that should be filtered (e.g., progress)
+        - None if not a valid JSON log (falls back to legacy handling)
+    """
+    trimmed = strip_ansi(line).strip()
+    prefixes = []
+    while match := _LOG_PREFIX.match(trimmed):
+        prefixes.append(match.group().rstrip().removesuffix(":"))
+        trimmed = trimmed[match.end() :]
+    if not trimmed.startswith("{") or not trimmed.endswith("}"):
+        return None
+
+    try:
+        entry = json.loads(trimmed)
+        if not isinstance(entry, dict):
+            return None
+        timestamp = entry.get("timestamp")
+        level = entry.get("level")
+        if not isinstance(timestamp, str) or not isinstance(level, str):
+            return None
+        if not timestamp or not level:
+            return None
+
+        # Skip progress logs in CLI - they're too spammy
+        if entry.get("type") == "progress":
+            return _SKIP_LINE
+        if "message" not in entry:
+            return None
+
+        # Format timestamp (extract time portion)
+        if "T" in timestamp:
+            time_part = timestamp.split("T")[1][:8]  # HH:MM:SS
+        else:
+            time_part = timestamp[:8]
+
+        level = level.upper()
+        message = entry["message"]
+        if not isinstance(message, str):
+            message = json.dumps(message, ensure_ascii=False)
+        # Match prime-rl's time / padded level / source / message layout.
+        # Keep distinct process/rank prefixes and tags; they need not identify
+        # the same worker, even when their numeric suffixes happen to match.
+        metadata = {
+            key: value
+            for key, value in entry.items()
+            if key not in {"timestamp", "level", "message"}
+        }
+        if entry.get("tag") is not None:
+            tag = metadata.pop("tag")
+            if not isinstance(tag, str):
+                tag = json.dumps(tag, ensure_ascii=False)
+            prefixes.append(f"[{tag}]")
+
+        exception = entry.get("exception")
+        if exception:
+            metadata.pop("exception")
+            if not isinstance(exception, str):
+                exception = json.dumps(exception, ensure_ascii=False)
+
+        # Diagnostic data stays visible, but off the main message row. Retain
+        # source-location and unfamiliar fields rather than silently omitting
+        # them to make the output shorter.
+        context = f"[dim]{rich_escape(' '.join(prefixes))}[/dim] " if prefixes else ""
+        safe_level = rich_escape(f"{level:>7}")
+        style = LEVEL_STYLES.get(level, "")
+        if style:
+            safe_level = f"[{style}]{safe_level}[/{style}]"
+        message = rich_escape(message).replace("\n", "\n    ")
+        rendered = f"[dim]{rich_escape(time_part)}[/dim] {safe_level} {context}{message}"
+        if metadata:
+            rendered += f"\n    [dim]{rich_escape(json.dumps(metadata, ensure_ascii=False))}[/dim]"
+        if exception:
+            rendered += "\n    " + rich_escape(exception.replace("\n", "\n    "))
+        return rendered
+
+    except (ValueError, RecursionError, TypeError, KeyError):
+        # JSONDecodeError is a ValueError; oversized integers and deeply
+        # nested records can also exceed the decoder/encoder limits.
+        return None
+
+
+def clean_logs(text: str) -> list[str]:
+    """Clean and format logs, detecting JSON format automatically.
+
+    Returns list of formatted lines.
+    """
+    lines = text.splitlines()
+    formatted_lines = []
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        # Try to parse as JSON log
+        formatted = format_json_log_line(line)
+        if formatted == _SKIP_LINE:
+            # Valid JSON but should be skipped (e.g., progress logs)
+            continue
+        elif formatted is not None:
+            formatted_lines.append(formatted)
+        else:
+            # Fall back to legacy handling
+            cleaned = strip_ansi(line)
+            # Skip tqdm-style progress bars
+            if PROGRESS_BAR.search(cleaned) or re.search(r"\d+%\|", cleaned):
+                if "100%" not in cleaned:
+                    continue
+            if cleaned.strip():
+                formatted_lines.append(rich_escape(cleaned))
+
+    return formatted_lines
+
+
+def _dict_id(config: Dict[str, Any] | None) -> Any:
+    return config.get("id") if isinstance(config, dict) else None
+
+
+def _env_display_name(env: Dict[str, Any], index: int | None = None) -> str:
+    taskset_id = _dict_id(env.get("taskset") if isinstance(env.get("taskset"), dict) else None)
+    value = env.get("slug") or env.get("name") or env.get("id") or taskset_id
+    if value:
+        return str(value)
+    return f"env-{index}" if index is not None else "?"
+
+
+def _remove_deprecated_config_keys(data: Dict[str, Any], out: Any = console) -> None:
+    """Remove deprecated config keys while warning users."""
+    removed = False
+    for key in ("trajectory_strategy", "trajectoryStrategy"):
+        if key in data:
+            data.pop(key, None)
+            removed = True
+
+    if removed:
+        out.print("[yellow]Warning:[/yellow] `trajectory_strategy` is deprecated and ignored.")
+
+    if "buffer" in data:
+        data.pop("buffer", None)
+        out.print(
+            "[yellow]Warning:[/yellow] `\\[buffer]` is deprecated and ignored: "
+            "the difficulty-filtering buffer was removed from the trainer."
+        )
+
+    eval_section = data.get("eval")
+    if isinstance(eval_section, dict) and "eval_base_model" in eval_section:
+        legacy = eval_section.pop("eval_base_model")
+        if "skip_first_step" in eval_section:
+            out.print(
+                "[yellow]Warning:[/yellow] `eval.eval_base_model` is deprecated and "
+                "ignored because `eval.skip_first_step` is also set. Remove "
+                "`eval_base_model` from your config."
+            )
+        else:
+            translated = (not legacy) if isinstance(legacy, bool) else legacy
+            eval_section["skip_first_step"] = translated
+            out.print(
+                "[yellow]Warning:[/yellow] `eval.eval_base_model` is deprecated: "
+                "prime-rl renamed it to `skip_first_step` with inverted meaning "
+                "(`eval_base_model = false` ≡ `skip_first_step = true`). "
+                f"Translating to `skip_first_step = {str(translated).lower()}` — "
+                "update your config to use `skip_first_step` directly."
+            )
+
+
+def _load_toml(config_path: str) -> Dict[str, Any]:
+    """Parse the run config. The raw table is shipped to the platform as-is
+    (prime-rl's schema is validated server-side), so the CLI only checks
+    that the file exists and is valid TOML."""
+    p = Path(config_path)
+    if not p.exists():
+        console.print(f"[red]Error:[/red] Config file not found: {config_path}")
+        raise typer.Exit(1)
+    try:
+        return toml.load(p)
+    except toml.TomlDecodeError as e:
+        console.print(f"[red]Error:[/red] Invalid TOML in {config_path}: {e}")
+        raise typer.Exit(1)
+
+
+def _looks_like_lora(cfg: Dict[str, Any]) -> bool:
+    """True iff the TOML is a retired shared-LoRA config: a top-level
+    `model = "..."` string or a top-level `[[env]]` array. prime-rl's
+    schemas take `[model]` as a table and have no top-level `env`, so
+    neither shape can be a valid dedicated config."""
+    return isinstance(cfg.get("model"), str) or isinstance(cfg.get("env"), list)
+
+
+def _looks_like_sft(cfg: Dict[str, Any]) -> bool:
+    """True iff the mega-TOML carries the prime-rl SFT schema shape: a
+    `[data]` block (required by SFTConfig, absent from the RL schema) and
+    no `[trainer]`/`[orchestrator]` blocks (required by the RL schema,
+    absent from SFTConfig). The two prime-rl TOML schemas are disjoint on
+    these keys, so the sniff is unambiguous without parsing the file with
+    either schema.
+    """
+    return "data" in cfg and "trainer" not in cfg and "orchestrator" not in cfg
+
+
+def _looks_like_pretrain(cfg: Dict[str, Any]) -> bool:
+    """True iff the config reads datatrove token shards, which only prime-rl's
+    PretrainConfig accepts. Pretrain configs also have the SFT shape, so this
+    sniff runs first."""
+    data = cfg.get("data")
+    return isinstance(data, dict) and data.get("type") == "datatrove"
+
+
+def _training_mode(cfg: Dict[str, Any], *, sft: bool) -> str:
+    """The prime-rl schema the config follows: pretrain for datatrove data, SFT
+    if `--sft` was passed or the config has the SFT shape, else RL."""
+    if _looks_like_pretrain(cfg):
+        return "pretrain"
+    if sft or _looks_like_sft(cfg):
+        return "sft"
+    return "rl"
+
+
+def _warn_legacy_full_finetune_type(cfg: Dict[str, Any], config_path: str) -> None:
+    """`type = "full_finetune"` used to be how dispatch routing was decided;
+    every RL run is dedicated now, so a leftover `type` key is dead weight.
+    Warn so configs get cleaned up instead of silently accumulating a field
+    nothing reads."""
+    if "type" in cfg:
+        console.print(
+            f'[yellow]Warning:[/yellow] `type = "{cfg["type"]}"` in {config_path} '
+            "is no longer used. Remove it from the config."
+        )
+
+
+# Mirrors the platform's `sourceRef` rules (branch / tag / sha charset, 200
+# chars, no `..`, `//` or `/.`, no trailing `/`) and rl-validator's refusal of
+# pull-request namespaces, so a typo fails at the prompt instead of as a 422.
+# Also applies the two git-check-ref-format rules the platform doesn't yet
+# check (no trailing `.`, no `/`-separated component ending in `.lock`): a
+# name breaking either can't resolve, so it would only fail later, at the
+# validator's fetch, after the user has already confirmed.
+_SOURCE_REF_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
+
+
+def _source_ref_error(ref: str) -> Optional[str]:
+    """Why `ref` can't be a prime-rl source ref, or None when it can."""
+    if (
+        not _SOURCE_REF_RE.match(ref)
+        or ".." in ref
+        or "//" in ref
+        or "/." in ref
+        or ref.endswith(("/", "."))
+        or any(part.endswith(".lock") for part in ref.split("/"))
+    ):
+        return f"{ref!r} is not a valid git ref (branches, tags and commit shas only)."
+    if ref.startswith(("refs/", "pull/")):
+        return (
+            f"{ref!r}: pull-request and refs/ names are not accepted; "
+            "use --pr N for a pull request."
+        )
+    return None
+
+
+def _resolve_pr_ref(pr_number: int) -> str:
+    """`--pr N` -> the PR's head commit sha, via the public GitHub API.
+
+    Resolved client-side so the run is pinned to the exact commit the user
+    saw, and so a fork or merged PR fails here with an actionable message.
+    The caller shows the sha in its pre-confirmation banner."""
+    try:
+        return resolve_pull_request_head(pr_number)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+def _collect_secrets(env: Optional[List[str]], env_files: List[str]) -> Dict[str, str]:
+    def _warn(msg: str) -> None:
+        console.print(f"[yellow]Warning:[/yellow] {msg}")
+
+    try:
+        secrets = collect_env_vars(
+            env_args=env,
+            env_files=env_files or None,
+            on_warning=_warn,
+        )
+    except EnvParseError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    secrets = secrets or {}
+
+    # Only these two are forwarded; dropping others would fail the run mid-training.
+    supported_secret_keys = {"WANDB_API_KEY", "HF_TOKEN"}
+    unsupported = sorted(k for k in secrets if k not in supported_secret_keys)
+    if unsupported:
+        console.print(
+            "[red]Error:[/red] full-FT runs only forward "
+            f"{', '.join(sorted(supported_secret_keys))} today; got "
+            f"unsupported secret(s): {', '.join(unsupported)}."
+        )
+        console.print(
+            "[dim]Drop these from --env-var/--env-file, or wait for "
+            "generic secret forwarding on the dedicated training endpoint.[/dim]"
+        )
+        raise typer.Exit(1)
+    return secrets
+
+
+# Strip CLI-only secret-loading keys before shipping the TOML to the
+# backend. `env_file` / `env_files` only meaningfully exist on the
+# caller's filesystem — the hosted pod doesn't see them, and prime-rl
+# has no use for the paths once we've already materialized the secrets
+# into the per-run k8s Secret above. Leaving them in the config either
+# confuses prime-rl (unknown field) or silently sends it chasing
+# phantom paths. `image_tag` is similarly chart-level — the backend
+# parses it off the request body, not the embedded prime-rl config.
+# `type` is stripped here too rather than left for the backend's
+# legacy CLI-metadata cleanup to silently absorb.
+_CLI_ONLY_KEYS = frozenset(
+    {
+        "env_file",
+        "env_files",
+        "image_tag",
+        "gpu_type",
+        "volume",
+        "volume_size",
+        "source_ref",
+        "type",
+    }
+)
+
+
+def _hosted_config(raw_cfg: Dict[str, Any], out: Any = console) -> Dict[str, Any]:
+    config = {k: v for k, v in raw_cfg.items() if k not in _CLI_ONLY_KEYS}
+    # In the prime-rl-native shape the deprecated keys live one level down,
+    # under `[orchestrator]` — and this config ships verbatim to the dedicated
+    # training endpoint, where orch v2 rejects the removed keys as
+    # "Extra inputs are not permitted".
+    orchestrator = config.get("orchestrator")
+    if isinstance(orchestrator, dict):
+        config["orchestrator"] = orchestrator = copy.deepcopy(orchestrator)
+        _remove_deprecated_config_keys(orchestrator, out)
+    return config
+
+
+_CONFIG_STRING_FORMS = {"volume_size": 'a string like "500Gi" or "2Ti"'}
+
+
+def _config_string(raw_cfg: Dict[str, Any], key: str, config_path: Any) -> Optional[str]:
+    value = raw_cfg.get(key)
+    if value is not None and not isinstance(value, str):
+        form = _CONFIG_STRING_FORMS.get(key, "a string")
+        raise ValueError(f"{key} in {config_path} must be {form}, got {type(value).__name__}.")
+    return value
+
+
+def _selected_source_ref(ref: Optional[str], config_ref: Any, config_path: Any) -> Optional[str]:
+    if config_ref is not None and not isinstance(config_ref, str):
+        raise ValueError(
+            f"source_ref in {config_path} must be a string, got {type(config_ref).__name__}."
+        )
+    # Each source is checked where it was given (so `--ref ""` is an error,
+    # not a silent fall-through to the TOML) before the CLI flag wins.
+    for label, candidate in (("--ref", ref), (f"source_ref in {config_path}", config_ref)):
+        problem = _source_ref_error(candidate) if candidate is not None else None
+        if problem:
+            raise ValueError(f"{label}: {problem}")
+    return ref or config_ref
+
+
+def _schema_input(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in config.items() if k != "name"}
+
+
+def _supports_local_validation(mode: Optional[str], config: Dict[str, Any]) -> bool:
+    from ..utils.training_compiler import SFT_ONLINE_EVAL_KEYS
+
+    return mode != "sft" or not SFT_ONLINE_EVAL_KEYS & config.keys()
+
+
+def _dispatch_dedicated_run(
+    *,
+    raw_cfg: Dict[str, Any],
+    config_path: str,
+    env: Optional[List[str]],
+    env_file: Optional[List[str]],
+    output: str,
+    yes: bool,
+    image_tag: Optional[str] = None,
+    gpu_type: Optional[str] = None,
+    volume: Optional[str] = None,
+    volume_size: Optional[str] = None,
+    mode: Optional[str] = None,
+    source_ref: Optional[str] = None,
+    source_pr: Optional[int] = None,
+    resume_from: Optional[str] = None,
+) -> None:
+    """Hand off to /api/v1/training/runs (prime-rl on a registered
+    PrimeCluster). Serves both dedicated run kinds: full-FT RL mega-TOMLs
+    (mode=None/"rl") and SFT mega-TOMLs (mode="sft" — same endpoint).
+
+    Backend always auto-picks the first uncordoned PrimeCluster — the
+    CLI never threads a cluster id, so a config that targets the wrong
+    cluster can't be a footgun."""
+    from ..utils.training_compiler import (
+        CompilationError,
+        SchemaEnvironmentUnavailable,
+        compile_locally,
+    )
+
+    name = raw_cfg.get("name")
+
+    # Link the dispatched run to the user's active team. Without this, the
+    # RFTRun row gets team_id=None and lands on the caller's personal
+    # account even when the CLI is configured for a team — confusing for
+    # billing + access scoping. Backend's `CreateDedicatedRunRequest.team_id`
+    # is Optional, so omitting it is silently wrong rather than a 400.
+    app_config = Config()
+    team_id = app_config.team_id
+
+    # Resolve env files relative to the config dir. We don't validate
+    # WANDB presence here — the chart wires WANDB_API_KEY via secretKeyRef
+    # only if `[wandb]` is configured AND the user passed --wandb-api-key,
+    # mirroring the platform's existing admin-dialog UX.
+    #
+    # `env_file` (deprecated, singular) is loaded first so `env_files`
+    # (canonical, plural) overrides it on key collision.
+    config_dir = Path(config_path).parent
+    cfg_env_files: List[str] = []
+    for key in ("env_file", "env_files"):
+        val = raw_cfg.get(key)
+        if isinstance(val, list):
+            cfg_env_files.extend(str(config_dir / p) for p in val)
+        elif isinstance(val, str):
+            cfg_env_files.append(str(config_dir / val))
+    all_env_files = cfg_env_files + (env_file or [])
+
+    secrets = _collect_secrets(env, all_env_files)
+
+    # `image_tag` is chart-level — it picks which prime-rl container build
+    # the run pulls. Two ways to set it: `--image-tag` (CLI flag, useful
+    # for ad-hoc pins / CI overrides) or top-level `image_tag = "..."` in
+    # the TOML (lives with the run config, the form most teams want to
+    # check in). CLI flag wins so an explicit override on the command line
+    # always beats the file. Backend defaults to "main" when neither is
+    # set, so falling through to None is the right "use platform default"
+    # signal.
+    try:
+        config_image_tag = _config_string(raw_cfg, "image_tag", config_path)
+        config_gpu_type = _config_string(raw_cfg, "gpu_type", config_path)
+        config_volume = _config_string(raw_cfg, "volume", config_path)
+        config_volume_size = _config_string(raw_cfg, "volume_size", config_path)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    resolved_image_tag = image_tag or config_image_tag
+
+    # `gpu_type` is request-level (narrows the backend cluster picker to
+    # PrimeClusters with matching gpuType), not prime-rl config. Two ways
+    # to set it: `--gpu-type` (CLI flag) or top-level `gpu_type = "..."`
+    # in the TOML. CLI flag wins. Falling through to None keeps today's
+    # "no preference, backend auto-picks" behaviour.
+    resolved_gpu_type = gpu_type or config_gpu_type
+
+    # `volume` is request-level too: `--volume` or top-level `volume = "..."`.
+    resolved_volume = volume or config_volume
+    # Size for a volume this command creates: `--volume-size` or top-level
+    # `volume_size = "..."`. Only used when the volume doesn't exist yet.
+    resolved_volume_size = volume_size or config_volume_size
+    if resolved_volume_size and not resolved_volume:
+        console.print(
+            "[red]Error:[/red] --volume-size (and top-level `volume_size`) needs "
+            "--volume (or top-level `volume`)."
+        )
+        raise typer.Exit(1)
+
+    # `source_ref` is request-level too: a prime-rl git ref (branch / tag /
+    # sha) the pods overlay onto the image at startup so unmerged code can
+    # be tested without an image build. `--ref` / `--pr` on the CLI, or
+    # top-level `source_ref = "..."` in the TOML. CLI flag wins. The
+    # platform resolves the ref to a commit at dispatch and pins that sha
+    # on the run, so a branch name here never drifts mid-run.
+    try:
+        resolved_source_ref = _selected_source_ref(
+            source_ref, raw_cfg.get("source_ref"), config_path
+        )
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    if source_pr is not None:
+        # Resolved here, after the local checks above, so a run that would
+        # fail on a bad secret, image tag or volume never pays the GitHub
+        # round trip (and never burns anonymous API quota).
+        resolved_source_ref = _resolve_pr_ref(source_pr)
+
+    config_payload = _hosted_config(
+        raw_cfg, get_console(stderr=True) if output == "json" else console
+    )
+    _warn_legacy_full_finetune_type(raw_cfg, config_path)
+
+    payload = build_payload_from_toml(
+        config_payload,
+        name=name,
+        team_id=team_id,
+        image_tag=resolved_image_tag,
+        wandb_api_key=secrets.get("WANDB_API_KEY"),
+        hf_token=secrets.get("HF_TOKEN"),
+        gpu_type=resolved_gpu_type,
+        volume=resolved_volume,
+        mode=mode,
+        source_ref=resolved_source_ref,
+        resume_from=resume_from,
+    )
+
+    api_client = APIClient()
+    client = HostedTrainingClient(api_client)
+    validation_ctx = (
+        console.status("[bold blue]Validating training config...", spinner="dots")
+        if output != "json"
+        else nullcontext()
+    )
+    try:
+        with validation_ctx:
+            selection: dict[str, Any] = {"mode": mode or "rl", "teamId": team_id}
+            if resolved_image_tag:
+                selection["imageTag"] = resolved_image_tag
+            if resolved_source_ref:
+                selection["sourceRef"] = resolved_source_ref
+            preparation = None
+            unavailable: Optional[Exception] = None
+            if _supports_local_validation(mode, config_payload):
+                try:
+                    preparation = client.prepare_local_validation(selection)
+                # A Platform without /prepare answers 405: the path matches
+                # DELETE /training/runs/{run_id}.
+                except (NotFoundError, MethodNotAllowedError):
+                    pass
+                except (ServerError, APITimeoutError) as exc:
+                    unavailable = exc
+            if preparation is not None and preparation.get("submission_supported") is True:
+                if preparation.get("mode") != selection["mode"]:
+                    raise CompilationError("Preparation returned a different training mode.")
+                try:
+                    payload["normalizedConfig"] = compile_locally(
+                        _schema_input(config_payload), preparation
+                    )
+                except SchemaEnvironmentUnavailable as exc:
+                    unavailable = exc
+    except (APIError, CompilationError) as exc:
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+    if output != "json":
+        if "normalizedConfig" in payload:
+            console.print("[green]✓ Run config validation succeeded[/green]")
+        else:
+            console.print(
+                "[yellow]Local validation is unavailable for this run; "
+                "Platform validates it on submission.[/yellow]"
+            )
+            if unavailable is not None:
+                console.print(f"[dim]{rich_escape(str(unavailable))}[/dim]")
+
+    # Surface the image + source pins before the confirmation so a typo'd
+    # ref is caught at the prompt, not by a failed dispatch. Skipped for
+    # --output json, which must emit nothing but the JSON payload.
+    if output != "json" and (resolved_image_tag or resolved_source_ref):
+        console.print("[cyan]prime-rl build[/cyan]")
+        image_display = (
+            f"[green]{rich_escape(resolved_image_tag)}[/green]"
+            if resolved_image_tag
+            else "[dim](platform default)[/dim]"
+        )
+        # highlight=False: Rich's auto-highlighter would otherwise recolour
+        # the digits inside the tag / sha / PR number on top of these styles.
+        console.print(f"  Image tag:  {image_display}", highlight=False)
+        if resolved_source_ref:
+            via_pr = f" [dim](PR #{source_pr})[/dim]" if source_pr is not None else ""
+            console.print(
+                f"  Source ref: [bold magenta]{rich_escape(resolved_source_ref)}[/bold magenta]"
+                f"{via_pr}",
+                highlight=False,
+            )
+        console.print()
+
+    # `--output json` is a formatting switch: still dispatch the run,
+    # then print the result as JSON ("create then format"), which
+    # automation relies on to parse back run_id from the response.
+    # Confirmation gating is purely on `--yes` so the JSON output path
+    # doesn't accidentally launch an expensive training job without an
+    # explicit ack.
+    if not confirm_or_skip("Launch this Hosted Training run?", yes, default=True):
+        console.print("\nRun cancelled")
+        raise typer.Exit(0)
+
+    # Skip the spinner for --output json: PrimeConsole.status() falls back
+    # to a plain print in --plain mode, which would emit "Creating Hosted
+    # Training run..." on stdout ahead of the JSON payload and break
+    # automation parsing of run_id.
+    # A resume runs on the paused run's volume, which the platform attaches
+    # and checks against any volume given here, so none is created for it.
+    if resolved_volume and not resume_from:
+        _ensure_volume(client, resolved_volume, team_id, output, size=resolved_volume_size)
+    status_ctx = (
+        console.status("[bold blue]Creating Hosted Training run...", spinner="dots")
+        if output != "json"
+        else nullcontext()
+    )
+    try:
+        with status_ctx:
+            result = client.create_run(payload)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {rich_escape(api_detail(e))}")
+        if resume_from:
+            console.print(
+                f"[yellow]Tip:[/yellow] a run resumes once "
+                f"`prime train get {resume_from}` shows PAUSED"
+            )
+        raise typer.Exit(1)
+
+    _report_dispatch(result, output=output, source_ref=resolved_source_ref)
+
+
+def _report_dispatch(
+    result: HostedTrainingRunResponse, *, output: str, source_ref: Optional[str] = None
+) -> None:
+    if output == "json":
+        # Don't expose token_value in JSON output either — the chart
+        # binds it via secretKeyRef and printing it leaks credentials
+        # into automation logs.
+        run_json: Dict[str, Any] = {"runId": result.run_id}
+        if source_ref:
+            run_json["sourceRef"] = source_ref
+        if result.on_demand:
+            # Only on the billed path: a reserved run has no hourly rate,
+            # and emitting nulls would read as "cost unknown".
+            run_json["onDemand"] = True
+            run_json["gpuType"] = result.gpu_type
+            run_json["pricePerGpuHour"] = result.price_per_gpu_hour
+            run_json["estimatedCostPerHour"] = result.estimated_cost_per_hour
+            run_json["isBeta"] = result.is_beta
+        output_data_as_json({"run": run_json}, console)
+        return
+
+    # Don't print result.token_value: the platform wires it into the
+    # per-run k8s Secret automatically (orchestrator's PRIME_API_KEY env
+    # via secretKeyRef). Surfacing it on stdout makes it easy to leak into
+    # shared shell history/CI logs without buying anything for the user.
+    console.print(f"[green]Dispatched[/green] hosted run [bold]{result.run_id}[/bold]")
+
+    # Placement is derived server-side, so state what it resolved to and
+    # what it costs. Without this the first time anyone sees the rate is
+    # the invoice.
+    if result.on_demand and result.price_per_gpu_hour is not None:
+        label = "On-demand (beta)" if result.is_beta else "On-demand"
+        line = f"[yellow]{label}[/yellow] {result.gpu_type or ''}".rstrip()
+        line += f" · ${result.price_per_gpu_hour:.2f}/GPU-hr"
+        if result.estimated_cost_per_hour is not None:
+            line += f" · ~${result.estimated_cost_per_hour:.2f}/hr"
+        console.print(line)
+        console.print(
+            "[dim]Billing starts when the pods are ready, not now, and stops "
+            "when the run ends.[/dim]"
+        )
+
+    dashboard_url = f"{Config().frontend_url}/dashboard/training/{result.run_id}"
+    console.print("\n[cyan]Monitor run at:[/cyan]")
+    console.print(f"  [link={dashboard_url}]{dashboard_url}[/link]")
+
+
+def _ensure_volume(
+    client: Any, name: str, team_id: Optional[str], output: str, size: Optional[str] = None
+) -> None:
+    """Create `name` (with `size`, default VOLUME_DEFAULT_SIZE) if it doesn't
+    exist and wait until it is created (the API reports RUNNING).
+
+    An existing volume in any state is left alone (the backend reports
+    "not ready" at dispatch); a `size` for it is ignored with a note (growing it
+    is `prime volumes expand`). Exits 1 on create failure, FAILED/TOMBSTONED,
+    or timeout. Progress goes to stderr for `--output json`. The backend
+    validates the size (e.g. 500Gi, 2Ti) and returns its error on create.
+    """
+    out = get_console(stderr=True) if output == "json" else console
+    try:
+        existing = [v for v in client.list_volumes(team_id=team_id) if v.name == name]
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    if existing:
+        if size and size != existing[0].size:
+            out.print(
+                f"Volume '{name}' already exists ({existing[0].size or 'unknown size'}); "
+                f"--volume-size {size} is ignored. Expand it with: prime volumes expand"
+            )
+        return
+
+    size = size or VOLUME_DEFAULT_SIZE
+    out.print(f"Volume '{name}' doesn't exist, creating it ({size})...")
+    try:
+        volume = client.create_volume(name, size, team_id=team_id)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    status_ctx = (
+        console.status(f"[bold blue]Waiting for volume '{name}' to be ready...", spinner="dots")
+        if output != "json"
+        else nullcontext()
+    )
+    deadline = time.monotonic() + VOLUME_READY_MAX_SECONDS
+    status = volume.status
+    with status_ctx:
+        while status != "RUNNING":
+            if status in ("FAILED", "TOMBSTONED"):
+                console.print(f"[red]Error:[/red] Volume '{name}' is {status}; not dispatching.")
+                raise typer.Exit(1)
+            if time.monotonic() >= deadline:
+                console.print(
+                    f"[red]Error:[/red] Timed out waiting for volume '{name}' "
+                    f"(last status {status}). Check `prime volumes list`."
+                )
+                raise typer.Exit(1)
+            time.sleep(VOLUME_READY_POLL_SECONDS)
+            try:  # a single failed poll is retried on the next loop
+                match = [v for v in client.list_volumes(team_id=team_id) if v.name == name]
+            except APIError:
+                continue
+            if match:
+                status = match[0].status
+
+
+# Status color mapping
+RUN_STATUS_COLORS = {
+    "QUEUED": "white",
+    "PENDING": "yellow",
+    "RUNNING": "green",
+    "COMPLETED": "cyan",
+    "FAILED": "red",
+    "STOPPED": "magenta",
+    "PAUSING": "yellow",
+    "PAUSED": "blue",
+}
+
+
+def _get_status_color(status: str) -> str:
+    return RUN_STATUS_COLORS.get(status.upper(), "white")
+
+
+def _render_failure_analysis(analysis: Dict[str, Any]) -> None:
+    """Render the automated failure-classifier output below run details.
+
+    The backend only returns this for RUN_ISSUE classifications, so we don't
+    surface the internal classifier tag — just the diagnosis itself.
+    """
+    root_cause = analysis.get("rootCause")
+    evidence = analysis.get("evidence")
+    if not root_cause and not (isinstance(evidence, list) and evidence):
+        return
+
+    header = "\n[bold]Failure Analysis[/bold]"
+    confidence = analysis.get("confidence")
+    if isinstance(confidence, (int, float)):
+        header += f" [dim](confidence {confidence * 100:.0f}%)[/dim]"
+    console.print(header)
+
+    if root_cause:
+        console.print(f"  Root Cause: {rich_escape(str(root_cause))}")
+
+    if isinstance(evidence, list) and evidence:
+        console.print("  Evidence:")
+        for line in evidence:
+            console.print(f"    - [dim]{rich_escape(str(line))}[/dim]")
+
+
+def _format_run_for_display(run: RLRun) -> Dict[str, Any]:
+    created_at = run.created_at.strftime("%Y-%m-%d %H:%M") if run.created_at else ""
+    env_names = [
+        _env_display_name(env, index=index) if isinstance(env, dict) else str(env)
+        for index, env in enumerate(run.environments)
+    ]
+    envs_display = ", ".join(env_names[:3])
+    if len(env_names) > 3:
+        envs_display += f" (+{len(env_names) - 3})"
+
+    return {
+        "id": run.id,
+        "status": run.status,
+        "model": run.base_model or "-",
+        "environments": envs_display,
+        "steps": "-" if run.max_steps is None else f"{run.max_steps}",
+        "gpus": "-" if run.gpu_count is None else str(run.gpu_count),
+        "rollouts": "-" if run.rollouts_per_example is None else str(run.rollouts_per_example),
+        "created_at": created_at,
+        "team_id": run.team_id,
+    }
+
+
+class DefaultGroup(DefaultCommandGroup):
+    """Makes 'run' the default command when a config file is passed."""
+
+    def __init__(self, *args, default_cmd_name: str = "run", **kwargs):
+        super().__init__(*args, default_cmd_name=default_cmd_name, **kwargs)
+        self._show_default_command_params = False
+
+    def format_usage(self, ctx, formatter):
+        formatter.write_usage(
+            ctx.command_path,
+            "[OPTIONS] CONFIG_PATH [ARGS]... | COMMAND [ARGS]...",
+        )
+
+    def get_params(self, ctx):
+        params = super().get_params(ctx)
+        if not self._show_default_command_params:
+            return params
+
+        default_command = self.commands.get(self.default_cmd_name)
+        if default_command is None:
+            return params
+
+        seen = {p.name for p in default_command.params}
+        return [*default_command.params, *(p for p in params if p.name not in seen)]
+
+    def format_help(self, ctx, formatter):
+        self._show_default_command_params = True
+        try:
+            return super().format_help(ctx, formatter)
+        finally:
+            self._show_default_command_params = False
+
+    def invoke(self, ctx):
+        if ctx.info_name == "rl":
+            typer.echo(
+                "[DEPRECATED] The 'rl' command is deprecated. Use 'prime train' instead.",
+                err=True,
+            )
+        return super().invoke(ctx)
+
+
+app = PlainTyper(
+    cls=DefaultGroup,
+    help=(
+        "Launch and manage Hosted Training runs. Pass a config path directly to start a new run."
+    ),
+    no_args_is_help=True,
+)
+
+
+@app.command("validate", rich_help_panel="Commands")
+def validate_training_config(
+    config_path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    schema_python: Optional[Path] = typer.Option(
+        None,
+        "--schema-python",
+        exists=True,
+        dir_okay=False,
+        help="Reuse an existing schema interpreter; its commit must match the hosted runtime.",
+    ),
+    sft: bool = typer.Option(False, "--sft", help="Validate a dedicated SFT config."),
+    image_tag: Optional[str] = typer.Option(None, "--image-tag"),
+    ref: Optional[str] = typer.Option(
+        None,
+        "--ref",
+        help="prime-rl branch, tag or commit to validate against. Its schema package "
+        "is installed and run on this machine.",
+    ),
+    pr: Optional[int] = typer.Option(
+        None,
+        "--pr",
+        min=1,
+        help="prime-rl pull request whose head commit to validate against. Its schema "
+        "package is installed and run on this machine.",
+    ),
+    artifact_out: Optional[Path] = typer.Option(None, "--artifact-out"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Validate dedicated RL/SFT config locally against the selected hosted runtime.
+
+    Experimental: creates no training run. Environment plugins and platform
+    dispatch policy are checked when submitting a run.
+    """
+    from ..api.training import HostedTrainingClient
+    from ..utils.training_compiler import CompilationError, compile_locally
+
+    validate_output_format(output, console)
+    try:
+        with config_path.open() as stream:
+            raw = toml.load(stream)
+        if ref is not None and pr is not None:
+            raise ValueError("--ref and --pr are mutually exclusive.")
+        source_ref = _selected_source_ref(ref, raw.get("source_ref"), config_path)
+        if pr is not None:
+            source_ref = resolve_pull_request_head(pr)
+        config_image_tag = _config_string(raw, "image_tag", config_path)
+        _config_string(raw, "gpu_type", config_path)
+        config_volume = _config_string(raw, "volume", config_path)
+        config_volume_size = _config_string(raw, "volume_size", config_path)
+        selected_image = image_tag or config_image_tag
+        notices = get_console(stderr=True) if output == "json" else console
+        if config_volume_size and not config_volume:
+            notices.print(
+                "[yellow]Warning:[/yellow] top-level `volume_size` needs a volume: "
+                "submit with --volume (or set top-level `volume`)."
+            )
+        config = _schema_input(_hosted_config(raw, notices))
+        mode = _training_mode(raw, sft=sft)
+        payload: dict[str, Any] = {"mode": mode, "teamId": Config().team_id}
+        if selected_image:
+            payload["imageTag"] = selected_image
+        if source_ref is not None:
+            payload["sourceRef"] = source_ref
+        client = HostedTrainingClient(APIClient())
+        status_ctx = (
+            console.status("[bold blue]Validating training config...", spinner="dots")
+            if output != "json"
+            else nullcontext()
+        )
+        with status_ctx:
+            preparation = client.prepare_local_validation(payload)
+            if preparation.get("mode") != payload["mode"]:
+                raise CompilationError("Preparation returned a different training mode.")
+            artifact = compile_locally(config, preparation, schema_python=schema_python)
+            if artifact_out:
+                artifact_out.write_text(json.dumps(artifact, indent=2) + "\n")
+        if output == "json":
+            output_data_as_json(artifact, console)
+        else:
+            console.print(f"Config validated locally against {artifact['schema_commit']}.")
+            console.print(
+                "Environment plugins and deployment policy remain deferred; no run submitted."
+            )
+            if not _supports_local_validation(mode, config):
+                console.print(
+                    rich_escape(
+                        "Online eval ([eval], [inference], [weight_broadcast]) is validated by "
+                        "Platform when you submit."
+                    )
+                )
+            if artifact_out:
+                console.print(f"Artifact written to {artifact_out}.")
+    except (APIError, CompilationError, OSError, ValueError, TypeError) as exc:
+        if output == "json":
+            output_data_as_json({"error": str(exc)}, console)
+        else:
+            console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+
+@app.command("run", rich_help_panel="Commands", hidden=True, epilog=RL_DISPATCH_JSON_HELP)
+def create_run(
+    config_path: str = typer.Argument(
+        ...,
+        help="Path to a TOML config file to launch as a Hosted Training run.",
+    ),
+    env: Optional[List[str]] = typer.Option(
+        None,
+        "-e",
+        "--env-var",
+        help=(
+            "Environment variable/secret to pass to the training container. "
+            "Accepts: KEY=VALUE (direct value), KEY (reads from $KEY), "
+            "or path/to/file.env (loads env file)."
+        ),
+    ),
+    env_file: Optional[List[str]] = typer.Option(
+        None,
+        "--env-file",
+        help="Path to .env file containing secrets. Supports ${VAR} expansion from local env.",
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    image_tag: Optional[str] = typer.Option(
+        None,
+        "--image-tag",
+        help=(
+            "prime-rl container image tag for the run. "
+            'Falls back to a top-level `image_tag = "..."` in the TOML '
+            "if unset, then to the backend default."
+        ),
+    ),
+    gpu_type: Optional[str] = typer.Option(
+        None,
+        "--gpu-type",
+        help=(
+            "GPU type to dispatch on (e.g. 'H200_141GB', "
+            "'B200_180GB'). Narrows the backend cluster picker to "
+            "PrimeClusters with matching gpuType. Falls back to a top-level "
+            '`gpu_type = "..."` in the TOML if unset, then to the backend '
+            "default (no preference, auto-pick)."
+        ),
+    ),
+    volume: Optional[str] = typer.Option(
+        None,
+        "--volume",
+        help=(
+            "Named volume for the run: outputs go under runs/<runId>/, and "
+            "for SFT the volume is mounted read-only at /volume, so "
+            "data.name must point at a path on the volume (e.g. "
+            '/volume/datasets/<name> or the relative "datasets/<name>" — '
+            "the platform resolves it). Upload a dataset with `prime volumes "
+            "put`; accounts with a cluster allocation can also use `prime "
+            "volumes ssh <volume> --read-write` and the huggingface CLI "
+            "inside that session (see `prime volumes`). Without a volume, "
+            "SFT only works with fake datasets. Falls back to a "
+            'top-level `volume = "..."` in the TOML. Created on the fly '
+            "(default 5Ti) if it doesn't exist."
+        ),
+    ),
+    volume_size: Optional[str] = typer.Option(
+        None,
+        "--volume-size",
+        help=(
+            "Size for the --volume if this command creates it, e.g. 500Gi or 2Ti "
+            "(default 5Ti). Ignored when the volume already exists. Falls back "
+            'to a top-level `volume_size = "..."` in the TOML.'
+        ),
+    ),
+    ref: Optional[str] = typer.Option(
+        None,
+        "--ref",
+        hidden=True,
+        help=(
+            "Restricted: prime-rl git ref (branch, tag, or sha) to run on top "
+            "of the image. The dispatch must be a team run and "
+            "the team needs sourceRef access granted by Prime (contact "
+            "support), on a deployment with source overlays enabled; other "
+            "callers get a 403. The pods overlay that source onto the image at "
+            "startup, so unmerged code runs without an image build; the "
+            "platform pins the resolved commit for the run. Falls back to a "
+            'top-level `source_ref = "..."` in the TOML.'
+        ),
+    ),
+    pr: Optional[int] = typer.Option(
+        None,
+        "--pr",
+        hidden=True,
+        help=(
+            "Restricted: prime-rl pull request number to run (same access "
+            "as --ref). Shorthand for --ref <PR head sha>; fork "
+            "and already-merged PRs are not supported."
+        ),
+    ),
+    full_finetune: bool = typer.Option(
+        False,
+        "--full-finetune",
+        "--fft",
+        hidden=True,
+        help=(
+            "Deprecated: every RL config now runs as a full fine-tune on a "
+            "dedicated cluster, so this flag is a no-op."
+        ),
+    ),
+    sft: bool = typer.Option(
+        False,
+        "--sft",
+        help=(
+            "Dispatch this config as a supervised fine-tune on the dedicated "
+            "training path. Usually unnecessary — an SFT config (a [data] "
+            "block and no [trainer]/[orchestrator]) is auto-detected. "
+            "Hosted SFT is trainer-only: [eval], [inference], and "
+            "[weight_broadcast] blocks are rejected. Datasets are local "
+            "files on a named volume (pass --volume): the run mounts that "
+            "volume read-only at /volume, so data.name points at a path "
+            "on it (e.g. /volume/datasets/<name> or the relative "
+            '"datasets/<name>" — the platform resolves it); outputs land '
+            "under runs/<runId>/ on the same volume. Get datasets there "
+            "yourself with `prime volumes ssh <volume> --read-write` and "
+            "the huggingface CLI inside that session (hf download <repo> "
+            "--repo-type dataset --local-dir datasets/<name>): materialize "
+            "HF load_dataset-readable files (Parquet/JSON, not "
+            "save_to_disk) into the volume's datasets/ directory, then "
+            "verify with a fresh-process load_dataset check. Without "
+            "--volume, only fake datasets work."
+        ),
+    ),
+    resume_from: Optional[str] = typer.Option(
+        None,
+        "--resume-from",
+        help=(
+            "ID of a PAUSED run to continue from its checkpoint. The new run "
+            "uses the paused run's volume; --volume, if given, must name it."
+        ),
+    ),
+) -> None:
+    """Launch a Hosted Training run from a config file.
+
+    Example:
+
+        prime train rl.toml
+        prime train sft.toml --sft
+        prime train sft.toml --sft --volume research
+    """
+    validate_output_format(output, console)
+
+    # Mutually exclusive run kinds: accepting both would silently resolve
+    # to whichever branch is checked first. --full-finetune/--fft is
+    # otherwise a no-op now that every RL run is dedicated.
+    if sft and full_finetune:
+        console.print(
+            "[red]Error:[/red] --sft and --full-finetune/--fft are mutually "
+            "exclusive — pick the run kind matching the config."
+        )
+        raise typer.Exit(1)
+    if ref is not None and pr is not None:
+        console.print("[red]Error:[/red] --ref and --pr are mutually exclusive.")
+        raise typer.Exit(1)
+    if resume_from is not None and not resume_from.strip():
+        console.print("[red]Error:[/red] --resume-from needs the ID of a PAUSED run.")
+        raise typer.Exit(1)
+
+    raw_cfg = _load_toml(config_path)
+
+    if _looks_like_lora(raw_cfg):
+        console.print(
+            f"[red]Error:[/red] {config_path} is a shared LoRA training config "
+            '(a top-level `model = "..."` or `\\[\\[env]]`). Shared LoRA training '
+            "no longer accepts new runs; Hosted Training runs prime-rl configs "
+            "on dedicated clusters. See prime-rl's examples/ for starter configs."
+        )
+        raise typer.Exit(1)
+
+    # Dispatch routing (see `_training_mode`). Unset [deployment] sizing
+    # falls through to prime-rl's own default, same as a local run.
+    mode: Optional[str] = _training_mode(raw_cfg, sft=sft)
+    if mode == "sft" and full_finetune:
+        console.print(
+            f"[red]Error:[/red] {config_path} looks like an SFT config "
+            "(a \\[data] block, no \\[trainer]/\\[orchestrator]) but "
+            "--full-finetune/--fft was passed. Use --sft instead."
+        )
+        raise typer.Exit(1)
+    if mode == "pretrain" and full_finetune:
+        console.print(
+            f"[red]Error:[/red] {config_path} is a pretrain config (datatrove "
+            "\\[data]) but --full-finetune/--fft was passed. Remove it."
+        )
+        raise typer.Exit(1)
+    # On SFT and pretrain the volume is also the dataset contract: it is
+    # mounted read-only at /volume, so `data.name` (SFT) or `data.paths`
+    # (pretrain shards) must point at paths on the volume; the platform
+    # resolves relative ones. RL payloads omit the mode.
+    if mode == "rl":
+        mode = None
+
+    _dispatch_dedicated_run(
+        raw_cfg=raw_cfg,
+        config_path=config_path,
+        env=env,
+        env_file=env_file,
+        output=output,
+        yes=yes,
+        image_tag=image_tag,
+        gpu_type=gpu_type,
+        volume=volume,
+        volume_size=volume_size,
+        mode=mode,
+        source_ref=ref,
+        source_pr=pr,
+        resume_from=resume_from,
+    )
+
+
+@app.command("models", rich_help_panel="Commands", epilog=RL_MODELS_JSON_HELP)
+def list_models(
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+    fft_only: bool = typer.Option(
+        False,
+        "--fft-only",
+        hidden=True,
+        help="Deprecated: the shared LoRA section is gone, so this is the default.",
+    ),
+) -> None:
+    """List available models for Hosted Training.
+
+    Shows the models pre-cached on dedicated dispatch clusters, plus
+    purchasable on-demand capacity when the backend reports it. The
+    on-demand beta-enrollment flag is tri-state: explicit false/true are
+    reported as backend data; unknown (field absent) is treated as no
+    signal, never as a denial.
+    """
+    validate_output_format(output, console)
+
+    try:
+        config = Config()
+        training_client = HostedTrainingClient(APIClient())
+        response = training_client.get_available_fft(team_id=config.team_id)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    fft_models = response.models
+    on_demand = response.on_demand
+    on_demand_beta_access = response.on_demand_beta_access
+
+    if output == "json":
+        # Always include the models key (empty allowed) so scripts can rely
+        # on `.available_fft_models[]` being present.
+        payload: dict[str, Any] = {"available_fft_models": [m.model_dump() for m in fft_models]}
+        if on_demand:
+            payload["on_demand"] = [o.model_dump() for o in on_demand]
+        if on_demand_beta_access is not None:
+            # `is not None` so an explicit false survives (a denial is
+            # data); unknown — older backend — is omitted.
+            payload["on_demand_beta_access"] = on_demand_beta_access
+        output_data_as_json(payload, console)
+        return
+
+    if fft_models:
+        _render_fft_models_table(fft_models)
+    elif not on_demand:
+        _render_discovery_empty_state(on_demand_beta_access)
+
+    if on_demand:
+        if fft_models:
+            console.print()
+        _render_on_demand_table(on_demand)
+
+
+def _render_discovery_empty_state(on_demand_beta_access: bool | None) -> None:
+    """Explain an empty model/on-demand discovery without guessing the cause.
+
+    - Explicit false is the backend saying the account is not enrolled in
+      the on-demand beta — the only state where asking for access is the
+      right next step.
+    - Explicit true means enrollment is fine and no on-demand capacity is
+      currently listed; that must not be blamed on enrollment.
+    - None means no enrollment signal reached us (older backend that omits
+      the field, or a 404 the client maps to an empty response). Stay
+      neutral — an unavailable or empty endpoint is not evidence of
+      missing access.
+    """
+    console.print("[yellow]No models available for Hosted Training.[/yellow]")
+    if on_demand_beta_access is False:
+        console.print(
+            "[dim]On-demand training is in beta. Contact Prime support to request access.[/dim]"
+        )
+    elif on_demand_beta_access is True:
+        console.print("[dim]No on-demand capacity is currently listed.[/dim]")
+    else:
+        console.print(
+            "[dim]No dispatchable clusters have a warm model cache yet, or the "
+            "endpoint isn't deployed on this backend.[/dim]"
+        )
+
+
+def _render_fft_models_table(fft_models: list) -> None:
+    """Render the FFT dispatch model listing.
+
+    Each model may be cached on multiple clusters/GPU types; we collapse
+    those into a single row with cluster+GPU joined so the table stays
+    scannable when a large model is warm everywhere.
+    """
+    table = Table(
+        title="Models",
+        title_justify="left",
+        caption_justify="left",
+    )
+    table.add_column("Model", style="cyan")
+    table.add_column("GPU Type(s)", style="magenta")
+
+    for model in sorted(fft_models, key=lambda m: _model_name_sort_key(m.name)):
+        gpu_types = sorted({c.gpu_type for c in model.clusters if c.gpu_type})
+        table.add_row(
+            model.name,
+            ", ".join(gpu_types) or "-",
+        )
+
+    table.caption = "[dim]Models pre-cached on clusters you can dispatch FFT runs to.[/dim]"
+    console.print(table)
+
+
+def _render_on_demand_table(on_demand: list) -> None:
+    """Render purchasable on-demand capacity.
+
+    Keyed by GPU type rather than by model, because an on-demand run
+    downloads a model that is not cached instead of being rejected — the
+    model table above covers what is warm.
+
+    `available_now` reports that the backend currently sees some free
+    pool headroom for the GPU type — a coarse capacity hint, not an
+    admission decision: whether a run starts or queues also depends on
+    its GPU count and topology, which the discovery endpoint knows
+    nothing about. Hence a `Capacity` column (available/busy) plus a
+    queue caveat, never a start-time promise.
+    """
+    beta = any(entry.is_beta for entry in on_demand)
+    table = Table(
+        title="On-Demand Capacity" + (" [yellow](beta)[/yellow]" if beta else ""),
+        title_justify="left",
+        caption_justify="left",
+    )
+    table.add_column("GPU Type", style="magenta")
+    table.add_column("$/GPU-hr", style="green", justify="right")
+    table.add_column("Capacity")
+
+    promos = []
+    for entry in on_demand:
+        table.add_row(
+            entry.gpu_type,
+            f"${entry.price_per_gpu_hour:.2f}",
+            "[green]available[/green]" if entry.available_now else "[yellow]busy[/yellow]",
+        )
+        if entry.discount_label:
+            promos.append(entry.discount_label)
+
+    # The rate is snapshotted at dispatch (queue promotion reuses it),
+    # while billable time only starts once pods are ready — two different
+    # events the old caption conflated into "when the run starts".
+    caption = [
+        "[dim]Rate fixed at dispatch; billed per GPU-hour from when pods "
+        "are ready, prorated to the second.[/dim]",
+        "[dim]Runs may queue depending on GPU count and topology.[/dim]",
+    ]
+    if promos:
+        joined = ", ".join(rich_escape(label) for label in sorted(set(promos)))
+        caption.append(f"[bold yellow]{joined}[/bold yellow]")
+    table.caption = "\n".join(caption)
+    console.print(table)
+
+
+@app.command("gpus", rich_help_panel="Commands")
+def list_gpus(
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List GPU types you can dispatch a full-FT run on.
+
+    Uses the active team from `prime config` when set, otherwise your
+    personal allocations. Pass any value to `prime train run
+    --gpu-type <value>` to steer dispatch.
+    """
+    validate_output_format(output, console)
+
+    try:
+        api_client = APIClient()
+        client = HostedTrainingClient(api_client)
+        config = Config()
+        response = client.list_available_gpu_types(team_id=config.team_id)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    if output == "json":
+        output_data_as_json({"gpuTypes": response.gpu_types}, console)
+        return
+
+    if not response.gpu_types:
+        console.print(
+            "[yellow]No GPU types available.[/yellow] Contact support if you need access."
+        )
+        return
+
+    console.print("[bold]Available GPU types[/bold] [dim](full-FT dispatch)[/dim]")
+    for gpu_type in response.gpu_types:
+        console.print(f"  [cyan]{gpu_type}[/cyan]")
+
+
+def _prompt_required_text(label: str, help_text: str, empty_error: str) -> str:
+    console.print(f"\n[bold]{label}[/bold] [dim](required)[/dim]")
+    console.print(f"[dim]{help_text}[/dim]")
+    while True:
+        value = typer.prompt("", prompt_suffix="> ").strip()
+        if value:
+            return value
+        console.print(f"[red]{empty_error}[/red]")
+
+
+def _prompt_optional_text(label: str, help_text: str) -> str | None:
+    console.print(f"\n[bold]{label}[/bold] [dim](optional)[/dim]")
+    console.print(f"[dim]{help_text}[/dim]")
+    value = typer.prompt("", default="", show_default=False, prompt_suffix="> ").strip()
+    return value or None
+
+
+def _format_model_request_feedback(models: str, context: str | None) -> str:
+    message = f"Hosted Training model request\n\nModels:\n{models}"
+    if context:
+        message += f"\n\nContext:\n{context}"
+    return message
+
+
+@app.command("request", rich_help_panel="Commands")
+def request_models() -> None:
+    """Request models for Hosted Training."""
+    console.print("[bold]Hosted Training Model Request[/bold]")
+    console.print("[dim]Tell us which models you want available for training.[/dim]")
+
+    try:
+        models = _prompt_required_text(
+            "Model(s)",
+            "Use provider/model names if you know them; comma-separated is fine.",
+            "At least one model is required.",
+        )
+        context = _prompt_optional_text(
+            "Use case or context",
+            "Share what you want to train or why this model matters.",
+        )
+    except Abort:
+        console.print("\n[yellow]Cancelled[/yellow]")
+        raise typer.Exit(0)
+
+    try:
+        submit_feedback(
+            message=_format_model_request_feedback(models, context),
+            category="feature",
+        )
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print("[green]Request submitted. Thanks![/green]")
+
+
+def _list_runs_impl(
+    team: Optional[str], num: int, page: int, output: str, mine: bool = False
+) -> None:
+    """Implementation for listing Hosted Training runs."""
+    validate_output_format(output, console)
+
+    if num < 1 or page < 1:
+        console.print("[red]Error:[/red] --num and --page must be at least 1")
+        raise typer.Exit(1)
+
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+        config = Config()
+
+        team_id = team or config.team_id
+
+        # Pagination and the `mine` filter are applied server-side when the
+        # backend supports it, so this normally fetches exactly the
+        # requested page instead of the caller's whole run history sorted/
+        # sliced locally.
+        run_page = rl_client.list_runs(team_id=team_id, mine=mine, page=page, limit=num)
+        runs = run_page.runs
+
+        if run_page.total is None:
+            # Backend predates pagination support: it silently ignored
+            # page/limit/mine and returned the full history. Fall back to
+            # the old client-side filter/sort/slice behavior.
+            if mine:
+                current_user_id = config.user_id
+                if not current_user_id:
+                    console.print(
+                        "[red]Error:[/red] Cannot filter by user - no user_id configured. "
+                        "Run [bold]prime whoami[/bold] to refresh your config."
+                    )
+                    raise typer.Exit(1)
+                runs = [r for r in runs if r.user_id == current_user_id]
+
+            total_count = len(runs)
+            runs = sorted(runs, key=lambda r: r.created_at, reverse=True)
+            start = (page - 1) * num
+            runs = runs[start : start + num]
+        else:
+            total_count = run_page.total
+
+        if output == "json":
+            output_data_as_json(
+                {
+                    "runs": [r.model_dump() for r in runs],
+                    "total": total_count,
+                    "page": page,
+                    "per_page": num,
+                },
+                console,
+            )
+            return
+
+        if not runs:
+            if page > 1:
+                console.print("[yellow]No more results.[/yellow]")
+            else:
+                console.print("[yellow]No Hosted Training runs found.[/yellow]")
+            return
+
+        table = Table(title="Hosted Training Runs")
+        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("Status", style="bold")
+        table.add_column("Model", style="magenta")
+        table.add_column("Environments", style="green")
+        table.add_column("Steps", justify="right")
+        table.add_column("GPUs", justify="right")
+        table.add_column("Created", style="dim")
+
+        for run in runs:
+            formatted = _format_run_for_display(run)
+            status_color = _get_status_color(run.status)
+            table.add_row(
+                formatted["id"],
+                f"[{status_color}]{formatted['status']}[/{status_color}]",
+                formatted["model"][:30],
+                formatted["environments"],
+                formatted["steps"],
+                formatted["gpus"],
+                formatted["created_at"],
+            )
+
+        console.print(table)
+
+        if total_count > page * num:
+            console.print(
+                f"\n[yellow]Showing page {page} of results. "
+                f"Use --page {page + 1} to see more.[/yellow]"
+            )
+        else:
+            console.print(f"\n[dim]Total: {total_count} run(s)[/dim]")
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("list", rich_help_panel="Commands", epilog=RL_LIST_JSON_HELP)
+def list_runs(
+    team: Optional[str] = typer.Option(None, "--team", "-t", help="Filter by team ID"),
+    mine: bool = typer.Option(
+        False, "--mine", help="Filter to only your own runs (useful for admin accounts)"
+    ),
+    num: int = typer.Option(20, "--num", "-n", help="Items per page"),
+    page: int = typer.Option(1, "--page", "-p", help="Page number"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List your runs (alias: ls)."""
+    _list_runs_impl(team, num, page, output, mine=mine)
+
+
+@app.command("get", rich_help_panel="Commands", epilog=RL_RUN_JSON_HELP)
+def get_run(
+    run_id: str = typer.Argument(..., help="Run ID to get details for"),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """Get details of a specific run.
+
+    Example:
+
+        prime train get <run_id>
+
+        prime train get <run_id> -o json
+    """
+    validate_output_format(output, console)
+
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        run = rl_client.get_run(run_id)
+
+        if output == "json":
+            output_data_as_json({"run": run.model_dump()}, console)
+            return
+
+        # Display run details
+        formatted = _format_run_for_display(run)
+        status_color = _get_status_color(run.status)
+
+        console.print(f"[bold]Run {run_id}[/bold]\n")
+        status_text = run.status
+        if run.status == "QUEUED" and run.runs_ahead is not None:
+            status_text += f" (~{run.runs_ahead} runs ahead)"
+        console.print(f"  Status: [{status_color}]{status_text}[/{status_color}]")
+        # Dedicated runs carry their cluster as primeClusterId
+        # (rftClusterId is NULL there); shared runs use cluster_id.
+        cluster = run.prime_cluster_id or run.cluster_id
+        if cluster:
+            console.print(f"  Cluster: {cluster}")
+        console.print(f"  Model: [magenta]{formatted['model']}[/magenta]")
+        console.print(f"  Environments: [green]{formatted['environments']}[/green]")
+        console.print(f"  Max Steps: {formatted['steps']}")
+        console.print(f"  GPUs: {formatted['gpus']}")
+        batch_size = "-" if run.batch_size is None else str(run.batch_size)
+        console.print(f"  Batch Size: {batch_size}")
+        console.print(f"  Rollouts per Example: {formatted['rollouts']}")
+        if run.max_tokens:
+            console.print(f"  Max Tokens: {run.max_tokens}")
+        if run.volume_name:
+            console.print(f"  Volume: [cyan]{run.volume_name}[/cyan]")
+        if run.wandb_project:
+            console.print(f"  W&B: {run.wandb_entity or ''}/{run.wandb_project}")
+        if run.team_id:
+            console.print(f"  Team: {run.team_id}")
+        if run.source_commit:
+            console.print(f"  Source Commit: {run.source_commit}")
+        console.print(f"  Created: [dim]{formatted['created_at']}[/dim]")
+        if run.started_at:
+            console.print(f"  Started: [dim]{run.started_at.strftime('%Y-%m-%d %H:%M')}[/dim]")
+        if run.completed_at:
+            console.print(f"  Completed: [dim]{run.completed_at.strftime('%Y-%m-%d %H:%M')}[/dim]")
+        if run.error_message:
+            console.print(f"  Error: [red]{run.error_message}[/red]")
+
+        if run.failure_analysis:
+            _render_failure_analysis(run.failure_analysis)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("stop", rich_help_panel="Commands")
+def stop_run(
+    run_id: str = typer.Argument(..., help="Run ID to stop"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Stop a run."""
+    try:
+        if not force:
+            confirm = typer.confirm(f"Are you sure you want to stop run {run_id}?")
+            if not confirm:
+                console.print("Cancelled.")
+                raise typer.Exit(0)
+
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        with console.status("[bold blue]Stopping run...", spinner="dots"):
+            run = rl_client.stop_run(run_id)
+
+            # Monotonic deadline (not an attempt counter) so a slow or
+            # stalled get_run call can't push the total wait past the
+            # advertised cap - the per-request timeout below is capped to
+            # whatever's left on the deadline too.
+            stop_budget_seconds = HOSTED_TRAINING_STOP_MAX_POLLS * HOSTED_TRAINING_STOP_POLL_SECONDS
+            deadline = time.monotonic() + stop_budget_seconds
+            while run.status.upper() not in TERMINAL_RUN_STATUSES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(HOSTED_TRAINING_STOP_POLL_SECONDS, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    run = rl_client.get_run(run_id, timeout=max(1, int(remaining)))
+                except APIError:
+                    # The stop itself already succeeded (rl_client.stop_run
+                    # returned above) - a timeout, transient connection
+                    # failure, or 5xx on a *follow-up status poll* is
+                    # inconclusive about the stop, not a failed stop. Fall
+                    # through to the same give-up messaging as running out
+                    # of poll budget, instead of a hard error.
+                    break
+
+        status_upper = run.status.upper()
+        if status_upper not in TERMINAL_RUN_STATUSES:
+            console.print(
+                f"[yellow]Run {run_id} did not reach a terminal state after "
+                f"{stop_budget_seconds:.0f}s - it's still being torn down in the "
+                f"background.[/yellow]"
+            )
+            console.print(f"Check status with: prime train get {run_id}")
+            raise typer.Exit(0)
+
+        color = _get_status_color(run.status)
+        if status_upper == "STOPPED":
+            console.print(f"[green]✓ Run {run_id} stopped successfully[/green]")
+        else:
+            console.print(
+                f"[yellow]Run {run_id} reached a terminal state before the stop "
+                f"completed - it was not actively stopped.[/yellow]"
+            )
+        console.print(f"Status: [{color}]{run.status}[/{color}]")
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("pause", rich_help_panel="Commands")
+def pause_run(
+    run_id: str = typer.Argument(..., help="Run ID to pause"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Pause a Hosted Training run at a checkpoint and release its GPUs.
+
+    A paused run cannot be unpaused; continue it with
+    `prime train resume <run_id>`.
+    """
+    if not force and not typer.confirm(f"Are you sure you want to pause run {run_id}?"):
+        console.print("Cancelled.")
+        raise typer.Exit(0)
+
+    try:
+        result = HostedTrainingClient(APIClient()).pause_run(run_id)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {rich_escape(api_detail(e))}")
+        raise typer.Exit(1)
+
+    status = result["status"]
+    color = _get_status_color(status)
+    console.print(f"[green]✓ Run {run_id} is pausing[/green]")
+    console.print(f"Status: [{color}]{status}[/{color}]")
+    console.print(f"Check progress with: prime train get {run_id}")
+    console.print(f"Once PAUSED, resume with: prime train resume {run_id}")
+
+
+@app.command("resume", rich_help_panel="Commands")
+def resume_run(
+    run_id: str = typer.Argument(..., help="ID of the PAUSED run to resume"),
+    env: Optional[List[str]] = typer.Option(
+        None,
+        "-e",
+        "--env-var",
+        help=(
+            "Secret to pass to the resumed run (WANDB_API_KEY, HF_TOKEN). "
+            "Accepts: KEY=VALUE (direct value), KEY (reads from $KEY), "
+            "or path/to/file.env (loads env file)."
+        ),
+    ),
+    env_file: Optional[List[str]] = typer.Option(
+        None,
+        "--env-file",
+        help="Path to .env file containing secrets. Supports ${VAR} expansion from local env.",
+    ),
+    gpu_type: Optional[str] = typer.Option(
+        None, "--gpu-type", help="GPU type to resume on. Defaults to the paused run's."
+    ),
+    image_tag: Optional[str] = typer.Option(
+        None,
+        "--image-tag",
+        help="prime-rl image tag to resume with. Defaults to the paused run's.",
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Resume a PAUSED Hosted Training run from its checkpoint as a new run.
+
+    The new run reuses the paused run's config, volume, image and GPU type.
+    Secrets are not kept once a run starts, so pass them again with
+    -e/--env-file.
+
+    Example:
+
+        prime train resume <run_id> -e WANDB_API_KEY
+    """
+    validate_output_format(output, console)
+    secrets = _collect_secrets(env, env_file or [])
+    payload = {
+        key: value
+        for key, value in {
+            "gpuType": gpu_type,
+            "imageTag": image_tag,
+            "wandbApiKey": secrets.get("WANDB_API_KEY"),
+            "hfToken": secrets.get("HF_TOKEN"),
+        }.items()
+        if value is not None
+    }
+
+    if not confirm_or_skip(f"Resume run {run_id} as a new Hosted Training run?", yes, default=True):
+        console.print("\nRun cancelled")
+        raise typer.Exit(0)
+
+    status_ctx = (
+        console.status("[bold blue]Resuming Hosted Training run...", spinner="dots")
+        if output != "json"
+        else nullcontext()
+    )
+    try:
+        with status_ctx:
+            result = HostedTrainingClient(APIClient()).resume_run(run_id, payload)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {rich_escape(api_detail(e))}")
+        raise typer.Exit(1)
+
+    _report_dispatch(result, output=output)
+
+
+@app.command("delete", rich_help_panel="Commands")
+def delete_run(
+    run_id: str = typer.Argument(..., help="Run ID to delete"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Delete a run."""
+    if not force:
+        confirm = typer.confirm(f"Are you sure you want to permanently delete run {run_id}?")
+        if not confirm:
+            console.print("Cancelled.")
+            raise typer.Exit(0)
+
+    api_client = APIClient()
+
+    # Always go through the LoRA-shared endpoint. The backend's
+    # `delete_single_run` kind-routes DEDICATED_FULL_FT rows server-side
+    # to `training_service.delete_dedicated_run` (helm uninstall + ns
+    # delete + token disable + soft-delete), so a single ownership-gated
+    # call handles both kinds correctly. Avoids:
+    #   * the admin-gate on the dedicated `/training/runs` endpoint
+    #     (non-admin owners couldn't delete their own runs via the
+    #     hosted-first probe),
+    #   * an Optional-kind-on-the-wire race where a missing field would
+    #     mis-route to the LoRA cleanup path on the CLI side and leak
+    #     the helm release.
+    rl_client = RLClient(api_client)
+    try:
+        rl_client.delete_run(run_id)
+        console.print(f"[green]✓ Run {run_id} deleted successfully[/green]")
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("restart", rich_help_panel="Commands")
+def restart_run(
+    run_id: str = typer.Argument(..., help="Run ID to restart"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Restart a running run from its latest checkpoint.
+
+    Only RUNNING runs can be restarted (checkpoints still on PVC).
+    For STOPPED/FAILED/COMPLETED runs, checkpoints have been cleaned up.
+
+    Example:
+
+        prime train restart <run_id>
+    """
+    try:
+        if not force:
+            confirm = typer.confirm(
+                f"Are you sure you want to restart run {run_id} from its latest checkpoint?"
+            )
+            if not confirm:
+                console.print("Cancelled.")
+                raise typer.Exit(0)
+
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        run = rl_client.restart_run(run_id)
+
+        console.print(f"[green]✓ Run {run_id} restarting from checkpoint[/green]")
+        console.print(f"Status: {run.status}")
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+def _print_formatted_log_line(line: str) -> None:
+    first, *continuations = line.split("\n")
+    # Parse our escaped markup exactly once. PrimeConsole's --plain path
+    # otherwise re-parses renderables and expands literal emoji tokens.
+    console.print(Text.from_markup(first, emoji=False), markup=False, highlight=False, emoji=False)
+    for continuation in continuations:
+        # Padding also applies to physical wraps, unlike leading spaces in a
+        # string. Keep long diagnostic/traceback rows under their own record.
+        content = continuation[4:] if continuation.startswith("    ") else continuation
+        console.print(
+            Padding(Text.from_markup(content, emoji=False), (0, 0, 0, 4)),
+            markup=False,
+            highlight=False,
+            emoji=False,
+        )
+
+
+def _print_log_lines(lines: list[str], raw: bool) -> None:
+    if raw:
+        for line in lines:
+            console.print(line, markup=False, highlight=False, emoji=False, soft_wrap=True)
+    else:
+        for line in clean_logs("\n".join(lines)):
+            _print_formatted_log_line(line)
+
+
+def _print_new_lines(last_lines: list[str], current_lines: list[str], raw: bool = False) -> None:
+    """Print only lines in current_lines that aren't in the tail of last_lines.
+
+    Uses suffix-prefix overlap detection to avoid reprinting lines between polls.
+    """
+    if current_lines == last_lines:
+        return
+    if not last_lines:
+        _print_log_lines(current_lines, raw)
+        return
+    overlap = 0
+    max_overlap = min(len(last_lines), len(current_lines))
+    for i in range(1, max_overlap + 1):
+        if last_lines[-i:] == current_lines[:i]:
+            overlap = i
+    _print_log_lines(current_lines[overlap:], raw)
+
+
+def _is_log_startup_error(error: APIError) -> bool:
+    message = str(error).lower()
+    startup_markers = (
+        "queued",
+        "pending",
+        "starting",
+        "initializing",
+        "not started",
+        "not available yet",
+        "logs are not available",
+        "logs not available",
+    )
+    return "404" in message and any(marker in message for marker in startup_markers)
+
+
+def _fetch_logs_with_startup_poll(fetch_fn: Any, tail: int, label: str) -> str:
+    for poll in range(HOSTED_TRAINING_LOG_STARTUP_POLLS + 1):
+        try:
+            return fetch_fn(tail)
+        except APIError as e:
+            if not _is_log_startup_error(e):
+                raise
+            if poll == 0:
+                console.print(
+                    f"[yellow]Hosted Training run is starting; waiting for {label} logs...[/yellow]"
+                )
+            if poll == HOSTED_TRAINING_LOG_STARTUP_POLLS:
+                console.print(
+                    "[yellow]Hosted Training run has not started yet. "
+                    "Logs will be available once it is running.[/yellow]"
+                )
+                raise typer.Exit(0)
+            time.sleep(HOSTED_TRAINING_LOG_STARTUP_POLL_SECONDS)
+
+    raise AssertionError("unreachable")
+
+
+def _stream_logs(
+    fetch_fn: Any,
+    tail: int,
+    raw: bool,
+    follow: bool,
+    label: str,
+) -> None:
+    """Common print loop for orchestrator and env-server log fetches."""
+
+    if follow:
+        console.print(f"[dim]Watching {label} logs... (Ctrl+C to stop)[/dim]\n")
+        last_lines: list[str] = []
+        consecutive_errors = 0
+
+        while True:
+            try:
+                raw_logs = fetch_fn(tail)
+                consecutive_errors = 0
+            except APIError as e:
+                if _is_log_startup_error(e):
+                    console.print(
+                        "[yellow]Hosted Training run is starting; waiting for logs...[/yellow]"
+                    )
+                    time.sleep(HOSTED_TRAINING_LOG_STARTUP_POLL_SECONDS)
+                    continue
+                consecutive_errors += 1
+                if "429" in str(e):
+                    if consecutive_errors >= 3:
+                        console.print("[yellow]Rate limited. Waiting 30s...[/yellow]")
+                        time.sleep(30)
+                    else:
+                        time.sleep(10)
+                    continue
+                raise
+
+            # Compare original records before presentation removes timestamp
+            # precision or filters progress lines from the polling window.
+            current_lines = raw_logs.splitlines()
+            _print_new_lines(last_lines, current_lines, raw)
+            last_lines = current_lines
+            time.sleep(HOSTED_TRAINING_LOG_FOLLOW_POLL_SECONDS)
+    else:
+        raw_logs = _fetch_logs_with_startup_poll(fetch_fn, tail, label)
+        rendered = raw_logs.splitlines() if raw else clean_logs(raw_logs)
+        if rendered:
+            for line in rendered:
+                if raw:
+                    console.print(line, markup=False, highlight=False, emoji=False, soft_wrap=True)
+                else:
+                    _print_formatted_log_line(line)
+        else:
+            console.print("[yellow]No logs available yet.[/yellow]")
+
+
+def _handle_logs_api_error(e: APIError) -> None:
+    if _is_log_startup_error(e):
+        msg = "Hosted Training run has not started yet. Logs will be available once running."
+        console.print(f"[yellow]{msg}[/yellow]")
+        raise typer.Exit(0)
+    console.print(f"[red]Error:[/red] {e}")
+    raise typer.Exit(1)
+
+
+# API ceilings for /rft/runs/{run_id}/logs: the search backend caps each
+# query at 5000 entries and the lookback window at 24h. Plain,
+# unfiltered orchestrator fetches are served from a 200-line snapshot;
+# --all / --since / --search / --level route through the search backend,
+# which honours --tail up to 5000.
+_MAX_LOG_TAIL_LINES = 5_000
+_MAX_LOG_WINDOW_SECONDS = 86_400
+_DEFAULT_LOG_TAIL_LINES = 1_000
+
+_SINCE_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86_400}
+
+
+def _parse_since(since: Optional[str]) -> Optional[int]:
+    """Convert a ``--since`` flag to a seconds value the backend accepts.
+
+    Accepts forms like ``15m``, ``1h``, ``6h``, ``24h``, ``900``. Returns
+    None when the flag isn't set (backend default applies)."""
+    if since is None:
+        return None
+    raw = since.strip().lower()
+    if not raw:
+        return None
+    if raw[-1] in _SINCE_UNIT_SECONDS and raw[:-1].isdigit():
+        seconds = int(raw[:-1]) * _SINCE_UNIT_SECONDS[raw[-1]]
+    elif raw.isdigit():
+        seconds = int(raw)
+    else:
+        raise typer.BadParameter(
+            f"Invalid --since value '{since}'. Use e.g. '15m', '1h', '6h', '24h', or seconds.",
+            param_hint="--since",
+        )
+    if seconds < 60 or seconds > 86_400:
+        raise typer.BadParameter(
+            "--since must be between 60s and 24h (86400s).",
+            param_hint="--since",
+        )
+    return seconds
+
+
+def _resolve_log_query(
+    tail: Optional[int], since: Optional[str], all_logs: bool
+) -> tuple[int, Optional[int]]:
+    """Resolve --tail / --since / --all into (tail_lines, since_seconds).
+
+    ``--all`` is shorthand for the API maxima: 5000 lines over the last
+    24h. Without it, --tail defaults to 1000 and is capped at the API
+    maximum with a clear error instead of a silent truncation.
+    """
+    if all_logs:
+        if tail is not None:
+            raise typer.BadParameter(
+                "--all already fetches the API maximum "
+                f"({_MAX_LOG_TAIL_LINES} lines); drop --tail.",
+                param_hint="--tail",
+            )
+        if since is not None:
+            raise typer.BadParameter(
+                "--all already uses the widest window (24h); drop --since.",
+                param_hint="--since",
+            )
+        return _MAX_LOG_TAIL_LINES, _MAX_LOG_WINDOW_SECONDS
+    if tail is None:
+        tail = _DEFAULT_LOG_TAIL_LINES
+    elif not 1 <= tail <= _MAX_LOG_TAIL_LINES:
+        raise typer.BadParameter(
+            f"--tail must be between 1 and {_MAX_LOG_TAIL_LINES} (API hard cap).",
+            param_hint="--tail",
+        )
+    return tail, _parse_since(since)
+
+
+def _parse_env_qualifier_with_index(env: str) -> tuple[str, int, bool]:
+    """Parse an env qualifier and report whether a numeric suffix was present."""
+    name, sep, idx_str = env.rpartition("/")
+    if sep and name and idx_str.isdigit():
+        return name, int(idx_str), True
+    return env, 0, False
+
+
+@app.command("logs", rich_help_panel="Monitoring")
+def get_logs(
+    run_id: str = typer.Argument(..., help="Run ID to get logs for"),
+    component: Optional[str] = typer.Option(
+        None,
+        "--component",
+        "-c",
+        help=(
+            "Pod to read logs from: 'orchestrator' (default), 'trainer', "
+            "'inference', or 'env-server'. trainer/inference apply only "
+            "to dedicated full-FT runs. Inferred from --env when omitted."
+        ),
+    ),
+    env: Optional[str] = typer.Option(
+        None,
+        "--env",
+        help=(
+            "Env-server name. Implies --component=env-server. "
+            "Use 'name/N' to disambiguate when multiple env-servers share a name. "
+            "List with 'prime train components <run_id>'."
+        ),
+    ),
+    tail: Optional[int] = typer.Option(
+        None,
+        "--tail",
+        "-n",
+        help=(
+            f"Number of lines to show (default {_DEFAULT_LOG_TAIL_LINES}, "
+            f"max {_MAX_LOG_TAIL_LINES})"
+        ),
+    ),
+    all_logs: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Fetch everything the API serves: the last 24h, up to "
+            f"{_MAX_LOG_TAIL_LINES} lines. Shorthand for "
+            f"--tail {_MAX_LOG_TAIL_LINES} --since 24h. "
+            "Mutually exclusive with --tail and --since."
+        ),
+    ),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output"),
+    raw: bool = typer.Option(
+        False, "--raw", "-r", help="Show original log lines (including JSON) without formatting"
+    ),
+    search: Optional[str] = typer.Option(
+        None,
+        "--search",
+        help=(
+            "Filter to lines containing this text. "
+            "Combine with --regex to use a regular expression instead of a substring."
+        ),
+    ),
+    regex: bool = typer.Option(
+        False,
+        "--regex",
+        help="Treat --search as a regex (RE2 syntax).",
+    ),
+    level: Optional[str] = typer.Option(
+        None,
+        "--level",
+        help="Filter to one log level: ERROR | WARNING | SUCCESS | INFO | DEBUG.",
+    ),
+    since: Optional[str] = typer.Option(
+        None,
+        "--since",
+        help=(
+            "How far back to look. Accepts e.g. '15m', '1h', '6h', "
+            "'24h', or a raw integer seconds value (60-86400). "
+            "Default 15m."
+        ),
+    ),
+) -> None:
+    """Get logs for a run.
+
+    Defaults to the orchestrator pod. Use ``--component`` to pick one of
+    ``trainer`` / ``inference`` / ``env-server`` (dedicated full-FT only).
+    Pass ``--env <name>`` to read an env-server pod by name (shorthand for
+    ``--component=env-server``).
+
+    List available pods first with ``prime train components <run_id>``.
+
+    JSON logs render as readable text by default. Use ``--raw`` to
+    preserve the original lines, including JSON and process prefixes.
+
+    Per-rank narrowing on multi-replica trainer/inference is not yet
+    surfaced here: the chart's default torchrun passes
+    `--local-ranks-filter=0` (ENG-6449), so each node's logs collapse to
+    its local rank 0, but a multi-node run still merges one line per
+    node. Per-node inspection needs kubectl + the PVC log files.
+
+    The API imposes hard ceilings: at most 5000 lines per request and a
+    24h lookback window. Plain, unfiltered fetches are served from a
+    200-line window; ``--all`` / ``--since`` / ``--search`` / ``--level``
+    route through the search backend, which honours ``--tail`` up to
+    5000 lines.
+
+    Examples:
+
+        prime train logs <run_id>
+        prime train logs <run_id> -f
+        prime train logs <run_id> --raw
+        prime train logs <run_id> --search Backpressure
+        prime train logs <run_id> --level ERROR --since 1h
+        prime train logs <run_id> --search 'Step \\d+' --regex
+        prime train logs <run_id> --all
+        prime train logs <run_id> -c trainer
+        prime train logs <run_id> -c inference
+        prime train logs <run_id> --env reverse-text
+        prime train logs <run_id> --env reverse-text/1 -f
+    """
+    valid_components = ("orchestrator", "trainer", "inference", "env-server")
+    if component is None:
+        component = "env-server" if env is not None else "orchestrator"
+    elif component not in valid_components:
+        raise typer.BadParameter(
+            f"Invalid component '{component}'. Use one of: {', '.join(valid_components)}.",
+            param_hint="--component",
+        )
+    if env is not None and component != "env-server":
+        raise typer.BadParameter(
+            f"--env applies only to env-server logs. Drop --component={component} or drop --env.",
+            param_hint="--env",
+        )
+    if component == "env-server" and env is None:
+        raise typer.BadParameter(
+            "--env is required when reading env-server logs. "
+            "Run 'prime train components <run_id>' to list available env-servers.",
+            param_hint="--env",
+        )
+
+    normalized_level: Optional[str] = None
+    if level:
+        normalized_level = level.upper()
+        if normalized_level not in {"ERROR", "WARNING", "SUCCESS", "INFO", "DEBUG"}:
+            raise typer.BadParameter(
+                f"Invalid level '{level}'. Use ERROR, WARNING, SUCCESS, INFO, or DEBUG.",
+                param_hint="--level",
+            )
+
+    if regex and not search:
+        raise typer.BadParameter(
+            "--regex has no effect without --search. Pass --search <pattern> too.",
+            param_hint="--regex",
+        )
+
+    tail, since_seconds = _resolve_log_query(tail, since, all_logs)
+
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        env_name_q, env_index_q, env_has_index_q = (
+            _parse_env_qualifier_with_index(env) if env is not None else (None, 0, False)
+        )
+
+        # Dedicated full-FT env-servers run as 1-replica-per-name
+        # StatefulSets, so a `name/N` qualifier (typed by hand or copied
+        # from a stale source) would incorrectly route through the
+        # legacy `/env-server-logs` endpoint and 404 on a backend that
+        # never registered an indexed pod for this run. Probe the run
+        # kind once and strip the index for full-FT runs so the unified
+        # `/logs` route handles them. Skipped for the no-index path
+        # (already routes correctly) and tolerated on probe failure
+        # (preserves prior behaviour for transient API blips).
+        if component == "env-server" and env is not None and env_has_index_q:
+            try:
+                if rl_client.get_run(run_id).kind == "DEDICATED_FULL_FT":
+                    env = env_name_q
+                    env_has_index_q = False
+            except APIError:
+                pass
+
+        if component == "env-server" and env is not None and env_has_index_q:
+            assert env_name_q is not None
+            # Legacy shared-RFT env-server (`name/index` qualifier) — go
+            # through the dedicated env-server endpoint which uses the
+            # cluster_id-backed pod lookup path. Dedicated full-FT
+            # env-servers use the unified /logs route with
+            # component=env-server + env_name (StatefulSets always run
+            # one pod per env, so no index disambiguation needed).
+
+            def fetch(t: int) -> str:
+                return rl_client.get_env_server_logs(
+                    run_id,
+                    env_name=env_name_q,
+                    env_index=env_index_q,
+                    tail_lines=t,
+                    search=search,
+                    regex=regex,
+                    level=normalized_level,
+                    since_seconds=since_seconds,
+                )
+
+            label = f"env-server {env}"
+        elif component == "orchestrator":
+
+            def fetch(t: int) -> str:
+                return rl_client.get_logs(
+                    run_id,
+                    tail_lines=t,
+                    search=search,
+                    regex=regex,
+                    level=normalized_level,
+                    since_seconds=since_seconds,
+                )
+
+            label = "orchestrator"
+        else:
+            # trainer / inference / dedicated env-server — unified /logs
+            # route. env (no slash) names the dedicated env-server's
+            # StatefulSet.
+            fetch_component = component
+            fetch_env = env if component == "env-server" else None
+
+            def fetch(t: int) -> str:
+                return rl_client.get_logs(
+                    run_id,
+                    tail_lines=t,
+                    search=search,
+                    regex=regex,
+                    level=normalized_level,
+                    since_seconds=since_seconds,
+                    component=fetch_component,
+                    env_name=fetch_env,
+                )
+
+            label = f"env-server {env}" if component == "env-server" else component
+
+        _stream_logs(
+            fetch_fn=fetch,
+            tail=tail,
+            raw=raw,
+            follow=follow,
+            label=label,
+        )
+
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped watching logs.[/dim]")
+    except APIError as e:
+        _handle_logs_api_error(e)
+
+
+@app.command("components", rich_help_panel="Monitoring")
+def list_components(
+    run_id: str = typer.Argument(..., help="Run ID to list components for"),
+) -> None:
+    """List pods (trainer/orchestrator + env-servers) for a run.
+
+    RL runs list the orchestrator; SFT runs list the trainer, since the
+    release has no orchestrator pod. An SFT run WITH online evals lists the
+    eval pod (shown as ``orchestrator``) and its inference pool too.
+
+    Use the env name shown here with
+    ``prime train logs <run_id> -c env-server --env <name>``. When multiple
+    env-servers share a name, the qualified form ``name/N`` is shown — pass
+    that exact string to ``--env``.
+
+    Example:
+
+        prime train components <run_id>
+    """
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+        run = rl_client.get_run(run_id)
+        env_servers: List[EnvServerInfo] = rl_client.list_env_servers(run_id)
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    table = Table(title=f"Components for {run_id}")
+    table.add_column("Component", style="cyan")
+    table.add_column("Env", style="green")
+    table.add_column("Status")
+
+    # SFT and pretrain runs are trainer-only, with no orchestrator pod,
+    # UNLESS they carry online evals (ENG-6565), which add an inference pool
+    # and an eval pod that the chart renders under the `orchestrator` role.
+    # Mirrors the platform's dedicated_primary_component choice, plus the
+    # same `[eval]` probe the dashboard's log tabs use.
+    supervised = run.loss in ("sft", "pretrain")
+    run_config = run.run_config if isinstance(run.run_config, dict) else {}
+    online_eval = supervised and isinstance(run_config.get("eval"), dict)
+
+    # Only the primary carries the run's status; the platform exposes no
+    # per-pod status for the others, so they show "-" like env-servers.
+    table.add_row("trainer" if supervised else "orchestrator", "-", run.status)
+    if online_eval:
+        # Readable with `-c orchestrator` / `-c inference`; without these rows
+        # the eval pod and its inference pool are invisible from the CLI.
+        table.add_row("orchestrator", "-", "-")
+        table.add_row("inference", "-", "-")
+
+    name_counts: Dict[str, int] = {}
+    for es in env_servers:
+        if es.env_name:
+            name_counts[es.env_name] = name_counts.get(es.env_name, 0) + 1
+
+    for es in env_servers:
+        if es.env_name and name_counts.get(es.env_name, 0) > 1:
+            env_label = f"{es.env_name}/{es.env_index}"
+        else:
+            env_label = es.env_name or "?"
+        # Dedicated env-servers are discovered from Loki, which has no
+        # pod status — show "-" instead of an empty cell.
+        table.add_row("env-server", env_label, es.status or "-")
+
+    console.print(table)
+    if env_servers:
+        console.print(
+            "\n[dim]View env-server logs with:[/dim] "
+            "[bold]prime train logs <run_id> -c env-server --env <env>[/bold]"
+        )
+
+
+@app.command("metrics", rich_help_panel="Monitoring", epilog=RL_METRICS_JSON_HELP)
+def get_metrics(
+    run_id: str = typer.Argument(..., help="Run ID to get metrics for"),
+    min_step: Optional[int] = typer.Option(None, "--min-step", help="Minimum step (inclusive)"),
+    max_step: Optional[int] = typer.Option(None, "--max-step", help="Maximum step (inclusive)"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Maximum number of records"),
+) -> None:
+    """Get Hosted Training metrics for a run.
+
+    Example:
+
+        prime train metrics <run_id>
+
+        prime train metrics <run_id> --min-step 10 --max-step 50
+
+        prime train metrics <run_id> | jq '.metrics[0]'
+    """
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        metrics = rl_client.get_metrics(
+            run_id,
+            min_step=min_step,
+            max_step=max_step,
+            limit=limit,
+        )
+
+        output_data_as_json({"metrics": metrics}, console)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("rollouts", rich_help_panel="Monitoring", epilog=RL_ROLLOUTS_JSON_HELP)
+def get_rollouts(
+    run_id: str = typer.Argument(..., help="Run ID to get rollouts for"),
+    step: int = typer.Option(..., "--step", "-s", help="Step number to get rollouts for"),
+    page: int = typer.Option(1, "--page", "-p", help="Page number (1-indexed)"),
+    num: int = typer.Option(100, "--num", "-n", help="Items per page"),
+) -> None:
+    """Get rollout samples for a run.
+
+    Example:
+
+        prime train rollouts <run_id> --step 10
+
+        prime train rollouts <run_id> -s 50 --num 100 | jq '.samples[0]'
+    """
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        result = rl_client.get_rollouts(
+            run_id,
+            step=step,
+            page=page,
+            limit=num,
+        )
+
+        output_data_as_json(result, console)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("progress", rich_help_panel="Monitoring", epilog=RL_PROGRESS_JSON_HELP)
+def get_progress(
+    run_id: str = typer.Argument(..., help="Run ID to get progress for"),
+) -> None:
+    """Get progress information, including which steps have samples and distributions.
+
+    Example:
+
+        prime train progress <run_id>
+
+        prime train progress <run_id> | jq '.latest_step'
+    """
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        progress = rl_client.get_progress(run_id)
+
+        output_data_as_json(progress, console)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("distributions", rich_help_panel="Monitoring", epilog=RL_DISTRIBUTIONS_JSON_HELP)
+def get_distributions(
+    run_id: str = typer.Argument(..., help="Run ID to get distributions for"),
+    distribution_type: Optional[str] = typer.Option(
+        None, "--type", "-t", help="Distribution type (defaults to all)"
+    ),
+    step: Optional[int] = typer.Option(
+        None, "--step", "-s", help="Step number (defaults to latest)"
+    ),
+) -> None:
+    """Get reward/advantage distribution histogram for a run.
+
+    Example:
+
+        prime train distributions <run_id>
+
+        prime train distributions <run_id> --type rewards --step 50
+    """
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        result = rl_client.get_distributions(
+            run_id,
+            distribution_type=distribution_type,
+            step=step,
+        )
+
+        output_data_as_json(result, console)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("checkpoints", rich_help_panel="Monitoring", epilog=RL_CHECKPOINTS_JSON_HELP)
+def list_checkpoints(
+    run_id: str = typer.Argument(..., help="Run ID to list checkpoints for"),
+    status_filter: Optional[str] = typer.Option(
+        None, "--status", "-s", help="Filter by status (READY, PENDING, UPLOADING, FAILED)"
+    ),
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List checkpoints for a run.
+
+    Example:
+
+        prime train checkpoints <run_id>
+
+        prime train checkpoints <run_id> --status READY
+    """
+    validate_output_format(output, console)
+
+    try:
+        api_client = APIClient()
+        rl_client = RLClient(api_client)
+
+        checkpoints = rl_client.list_checkpoints(run_id, status_filter=status_filter)
+
+        if output == "json":
+            output_data_as_json({"checkpoints": [cp.model_dump() for cp in checkpoints]}, console)
+            return
+
+        if not checkpoints:
+            console.print("[yellow]No checkpoints found for this run.[/yellow]")
+            return
+
+        table = Table(title=f"Checkpoints for {run_id}")
+        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("Step", justify="right", style="bold")
+        table.add_column("Status", style="bold")
+        table.add_column("Size", justify="right")
+        table.add_column("Created", style="dim")
+
+        status_colors = {
+            "READY": "green",
+            "PENDING": "yellow",
+            "UPLOADING": "blue",
+            "FAILED": "red",
+        }
+
+        for cp in checkpoints:
+            color = status_colors.get(cp.status, "white")
+            table.add_row(
+                cp.id,
+                str(cp.step),
+                f"[{color}]{cp.status}[/{color}]",
+                format_file_size(cp.size_bytes) if cp.size_bytes is not None else "-",
+                cp.created_at.strftime("%Y-%m-%d %H:%M"),
+            )
+
+        console.print(table)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# `prime train usage` — token usage and price for one run; lives next to the
+# other run-scoped monitoring commands. Implemented in commands/usage.py and
+# also re-exposed as the top-level `prime usage` summary command.
+app.command("usage", rich_help_panel="Monitoring", epilog=RUN_USAGE_JSON_HELP)(run_usage_command)

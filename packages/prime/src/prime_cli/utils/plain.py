@@ -1,0 +1,283 @@
+import io
+import sys
+import traceback
+from contextlib import nullcontext
+from copy import copy
+from typing import Any
+
+import click
+import typer
+from rich.console import Console
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+from typer.core import TyperCommand, TyperGroup, _main
+from typer.models import Default, DefaultPlaceholder
+
+HELP_NOTE = (
+    "IMPORTANT: If you are AI, ALWAYS use --plain when using the prime CLI to get a terse "
+    "version of the content without any design elements designed for humans. "
+    "For any list-style query, use --output json and pipe to jq. "
+    "You get the json schema for any list command by using --help."
+)
+
+
+# Plain tables render at their natural width; this is only an upper bound so
+# cells never wrap or truncate.
+_PLAIN_TABLE_WIDTH = 10_000
+
+
+def _plain_text_console(width: int | None = None) -> Console:
+    """Recording console that renders markup-free, style-free text."""
+    return Console(
+        record=True,
+        file=io.StringIO(),
+        # Rich treats any non-empty FORCE_COLOR as a terminal and pins a
+        # TERM=dumb terminal to 80 columns, ignoring `width`.
+        force_terminal=False,
+        width=width,
+        no_color=True,
+        highlight=False,
+        emoji=False,
+    )
+
+
+def is_plain_mode(args: list[str] | None = None) -> bool:
+    ctx = click.get_current_context(silent=True)
+    while ctx is not None:
+        if ctx.meta.get("plain"):
+            return True
+        ctx = ctx.parent
+
+    for arg in sys.argv[1:] if args is None else args:
+        if arg == "--":
+            return False
+        if arg == "--plain":
+            return True
+    return False
+
+
+class PrimeConsole(Console):
+    def __init__(self, *, stderr: bool = False, **kwargs: Any) -> None:
+        super().__init__(stderr=stderr, **kwargs)
+        plain_console_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"emoji", "highlight", "markup", "no_color"}
+        }
+        self._plain_console = Console(
+            stderr=stderr,
+            no_color=True,
+            markup=False,
+            highlight=False,
+            emoji=False,
+            soft_wrap=True,
+            **plain_console_kwargs,
+        )
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n", **kwargs: Any) -> None:
+        if not is_plain_mode():
+            super().print(*objects, sep=sep, end=end, **kwargs)
+            return
+
+        markup = kwargs.pop("markup", None)
+        kwargs.pop("highlight", None)
+        plain_objects = []
+        for obj in objects:
+            if isinstance(obj, Table):
+                table = copy(obj)
+                table.box = None
+                table.show_lines = False
+                table.border_style = ""
+                table.header_style = ""
+                table.row_styles = []
+                table.pad_edge = False
+                table.padding = (0, 1)
+                console = _plain_text_console(width=_PLAIN_TABLE_WIDTH)
+                console.print(table, markup=markup)
+                lines = console.export_text().rstrip().splitlines()
+                plain_objects.append("\n".join(line.rstrip() for line in lines))
+                continue
+
+            text = ""
+            if obj is not None:
+                if isinstance(obj, Syntax):
+                    text = obj.code
+                elif isinstance(obj, Text):
+                    text = obj.plain
+                elif hasattr(obj, "__rich_console__"):
+                    # Rich renderables (NewLine from Progress, Rule, Control)
+                    # render to plain text instead of printing their repr.
+                    console = _plain_text_console()
+                    console.print(obj, markup=False)
+                    text = console.export_text().rstrip("\n")
+                else:
+                    text = str(obj)
+
+            if markup is not False:
+                try:
+                    text = Text.from_markup(text).plain
+                except Exception:
+                    pass
+            plain_objects.append(text)
+
+        self._plain_console.print(sep.join(plain_objects), end=end, **kwargs)
+
+    def status(self, status: str, *args: Any, **kwargs: Any):
+        if is_plain_mode():
+            self.print(status)
+        elif getattr(self.file, "isatty", lambda: False)():
+            return super().status(status, *args, **kwargs)
+        return nullcontext()
+
+    def print_exception(self, *args: Any, **kwargs: Any) -> None:
+        if is_plain_mode():
+            self._plain_console.print(traceback.format_exc().rstrip())
+            return
+        super().print_exception(*args, **kwargs)
+
+
+get_console = PrimeConsole
+
+
+def _help_note(obj, ctx):
+    if ctx.parent is None and getattr(obj, "name", None) == "prime":
+        return HELP_NOTE
+    return None
+
+
+def _plain_option(params):
+    params = list(params or [])
+    if any(isinstance(param, click.Option) and "--plain" in param.opts for param in params):
+        return params
+
+    def enable_plain(ctx, _, value):
+        if value:
+            ctx.meta["plain"] = True
+
+    params.insert(
+        next(
+            (
+                i
+                for i, param in enumerate(params)
+                if isinstance(param, click.Option) and "--help" in param.opts
+            ),
+            len(params),
+        ),
+        click.Option(
+            ["--plain"],
+            is_flag=True,
+            expose_value=False,
+            is_eager=True,
+            callback=enable_plain,
+            help="Use plain, terse outputs. USE THIS IF YOU ARE AI.",
+        ),
+    )
+    return params
+
+
+class _PlainMixin:
+    def __init__(self, *args, params=None, **kwargs):
+        super().__init__(*args, params=_plain_option(params), **kwargs)
+
+    def parse_args(self, ctx, args):
+        # Click only shows no-args help for an empty argument list, so a lone
+        # `--plain` would otherwise parse into a silent no-op.
+        if self.no_args_is_help and args and all(arg == "--plain" for arg in args):
+            ctx.meta["plain"] = True
+            args = []
+        return super().parse_args(ctx, args)
+
+    def main(
+        self,
+        args=None,
+        prog_name=None,
+        complete_var=None,
+        standalone_mode=True,
+        windows_expand_args=True,
+        **extra,
+    ):
+        plain = is_plain_mode(args)
+        return _main(
+            self,
+            args=args,
+            prog_name=prog_name,
+            complete_var=complete_var,
+            standalone_mode=standalone_mode,
+            windows_expand_args=windows_expand_args,
+            rich_markup_mode=None if plain else self.rich_markup_mode,
+            **extra,
+        )
+
+    def format_help(self, ctx, formatter):
+        note = _help_note(self, ctx)
+        if not is_plain_mode():
+            if note:
+                from typer import rich_utils
+
+                rich_utils._get_rich_console().print(Text(note, style="dim"))
+            return super().format_help(ctx, formatter)
+
+        if note:
+            formatter.write_text(f"Note: {note}\n")
+        rich_markup_mode = self.rich_markup_mode
+        self.rich_markup_mode = None
+        try:
+            return super().format_help(ctx, formatter)
+        finally:
+            self.rich_markup_mode = rich_markup_mode
+
+
+class _PlainTyperCommand(_PlainMixin, TyperCommand):
+    pass
+
+
+COMMAND_ALIASES = {
+    "ls": "list",
+}
+
+
+class PlainAwareTyperGroup(_PlainMixin, TyperGroup):
+    def get_command(self, ctx, cmd_name):
+        cmd = super().get_command(ctx, cmd_name)
+        if cmd is not None:
+            return cmd
+        target = COMMAND_ALIASES.get(cmd_name)
+        if target is None:
+            return None
+        return super().get_command(ctx, target)
+
+
+class DefaultCommandGroup(PlainAwareTyperGroup):
+    def __init__(self, *args, default_cmd_name: str = "run", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.default_cmd_name = default_cmd_name
+
+    def parse_args(self, ctx, args):
+        if not args:
+            return super().parse_args(ctx, args)
+
+        decision_args = [arg for arg in args if arg != "--plain"]
+        if not decision_args:
+            return super().parse_args(ctx, args)
+
+        if decision_args[0] in ("--help", "-h"):
+            return super().parse_args(ctx, args)
+
+        if self.get_command(ctx, decision_args[0]) is not None:
+            return super().parse_args(ctx, args)
+
+        args = [self.default_cmd_name] + list(args)
+        return super().parse_args(ctx, args)
+
+
+class PlainTyper(typer.Typer):
+    def __init__(self, *args, cls=None, **kwargs):
+        super().__init__(*args, cls=cls or PlainAwareTyperGroup, **kwargs)
+
+    def callback(self, *, cls=Default(None), **kwargs):
+        cls = PlainAwareTyperGroup if isinstance(cls, DefaultPlaceholder) or cls is None else cls
+        return super().callback(cls=cls, **kwargs)
+
+    def command(self, name=None, *, cls=None, **kwargs):
+        return super().command(name=name, cls=cls or _PlainTyperCommand, **kwargs)

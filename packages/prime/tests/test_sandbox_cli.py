@@ -1,0 +1,1882 @@
+import json
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from prime_cli.commands.sandbox import _format_sandbox_expiry
+from prime_cli.main import app
+from prime_cli.utils import strip_ansi
+from prime_sandboxes import APIError, HeaderRule, SandboxCheckpoint, StartCommand
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+
+def _flat(text: str) -> str:
+    """Collapse terminal wrapping so assertions check semantics, not layout."""
+    return " ".join(text.split())
+
+
+def test_checkpoint_command_and_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+    checkpoint = SandboxCheckpoint(
+        id="checkpoint-1",
+        sandbox_id="sandbox-1",
+        state="PENDING",
+        depth=1,
+        docker_image="python:3.11-slim",
+        occupied_bytes=2 * 1024**2,
+        stored_bytes=1024**2,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    ttls: list[Any] = []
+
+    def create(self: Any, sandbox_id: str, ttl_seconds: Any = None) -> SandboxCheckpoint:
+        assert sandbox_id == "sandbox-1"
+        ttls.append(ttl_seconds)
+        return checkpoint
+
+    listed: list[tuple[str, Any]] = []
+
+    def list_checkpoints(
+        self: Any, sandbox_id: str, checkpoint_id: Any = None
+    ) -> list[SandboxCheckpoint]:
+        listed.append((sandbox_id, checkpoint_id))
+        return [checkpoint.model_copy(update={"state": "DURABLE"})]
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.checkpoint", create)
+    monkeypatch.setattr(
+        "prime_cli.commands.sandbox.SandboxClient.list_checkpoints", list_checkpoints
+    )
+
+    created = runner.invoke(app, ["sandbox", "checkpoint", "create", "sandbox-1"])
+    assert created.exit_code == 0, created.output
+    assert "checkpoint-1" in created.output
+    assert "prime sandbox checkpoint list sandbox-1" in created.output
+    with_ttl = runner.invoke(app, ["sandbox", "checkpoint", "create", "sandbox-1", "--ttl", "7d"])
+    assert with_ttl.exit_code == 0, with_ttl.output
+    assert ttls == [None, 7 * 86400]
+
+    table = runner.invoke(app, ["sandbox", "checkpoint", "list", "sandbox-1"])
+    assert table.exit_code == 0, table.output
+    assert "checkpoint-1" in table.output and "DURABLE" in table.output
+    # Size (quota measure) and Stored (compressed billing metric) both shown.
+    assert "Size" in table.output and "2.0 MiB" in table.output
+    assert "1.0 MiB" in table.output
+
+    durable = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "checkpoint",
+            "list",
+            "sandbox-1",
+            "--checkpoint-id",
+            "checkpoint-1",
+            "--output",
+            "json",
+        ],
+    )
+    assert durable.exit_code == 0, durable.output
+    assert json.loads(durable.output)["checkpoints"][0]["state"] == "DURABLE"
+    assert listed == [("sandbox-1", None), ("sandbox-1", "checkpoint-1")]
+
+
+def test_checkpoint_get_by_id_states_and_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+    states = {
+        "cp-pending": ("PENDING", None),
+        "cp-durable": ("DURABLE", None),
+        "cp-failed": ("FAILED", "upload failed"),
+    }
+    requested: list[str] = []
+
+    def get_checkpoint(self: Any, checkpoint_id: str) -> SandboxCheckpoint:
+        requested.append(checkpoint_id)
+        state, error = states[checkpoint_id]
+        return SandboxCheckpoint(
+            id=checkpoint_id,
+            sandbox_id="sandbox-1",
+            state=state,
+            depth=1,
+            docker_image="python:3.11-slim",
+            occupied_bytes=3 * 1024**2,
+            error=error,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get_checkpoint", get_checkpoint)
+
+    for checkpoint_id, (state, error) in states.items():
+        result = runner.invoke(app, ["sandbox", "checkpoint", "get", checkpoint_id])
+        assert result.exit_code == 0, result.output
+        output = " ".join(strip_ansi(result.output).split())
+        assert checkpoint_id in output
+        assert state in output
+        assert "Size: 3.0 MiB" in output
+        # Neutral by-id output: a volume checkpoint is never restorable.
+        assert "Restorable" not in output
+        if error:
+            assert error in output
+
+    assert requested == list(states)
+
+    def missing(self: Any, checkpoint_id: str) -> SandboxCheckpoint:
+        raise APIError(f"HTTP 404: Checkpoint {checkpoint_id} not found")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get_checkpoint", missing)
+
+    failing = runner.invoke(app, ["sandbox", "checkpoint", "get", "cp-missing"])
+    assert failing.exit_code == 1, failing.output
+    assert "HTTP 404" in strip_ansi(failing.output)
+
+
+def test_restore_command_creates_from_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def create(self: Any, request: Any) -> SimpleNamespace:
+        captured["request"] = request
+        return SimpleNamespace(id="restored-1")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", create)
+    result = runner.invoke(
+        app, ["sandbox", "checkpoint", "restore", "checkpoint-1", "--name", "fork", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["request"].checkpoint_id == "checkpoint-1"
+    assert captured["request"].name == "fork"
+    assert captured["request"].docker_image is None
+    assert captured["request"].disk_size_gb is None
+    assert "restored-1" in result.output
+
+
+def test_fork_checkpoints_waits_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+    calls: list[Any] = []
+    source = _fake_sandbox(
+        id="sbx-1", team_id="team-1", region="us", gpu_count=0, gpu_type=None, labels=["a"]
+    )
+    pending = SimpleNamespace(id="checkpoint-1")
+
+    def create(self: Any, request: Any) -> SimpleNamespace:
+        calls.append(request)
+        return SimpleNamespace(id="forked-1")
+
+    def wait(self: Any, checkpoint_id: str, timeout_seconds: float) -> SimpleNamespace:
+        calls.append(("wait", checkpoint_id, timeout_seconds))
+        return pending
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get", lambda self, sid: source)
+    monkeypatch.setattr(
+        "prime_cli.commands.sandbox.SandboxClient.checkpoint", lambda self, sid: pending
+    )
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.wait_for_checkpoint", wait)
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", create)
+
+    result = runner.invoke(app, ["sandbox", "fork", "sbx-1", "--cpu-cores", "4", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert calls[0] == ("wait", "checkpoint-1", 300)
+    request = calls[1]
+    assert request.checkpoint_id == "checkpoint-1"
+    assert request.name == "box-fork"
+    assert request.cpu_cores == 4
+    assert request.memory_gb == source.memory_gb
+    assert request.team_id == "team-1" and request.labels == ["a"]
+    assert "forked-1" in result.output
+
+
+def _fake_sandbox(**overrides: Any) -> SimpleNamespace:
+    """A sandbox stand-in with every field the list formatter reads."""
+    now = datetime.now(timezone.utc)
+    base: dict[str, Any] = dict(
+        id="sbx-1",
+        name="box",
+        docker_image="python:3.12",
+        status="RUNNING",
+        cpu_cores=1.0,
+        memory_gb=2.0,
+        gpu_count=0,
+        region="us",
+        labels=[],
+        created_at=now,
+        started_at=now - timedelta(minutes=10),
+        timeout_minutes=60,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _fake_detailed_sandbox(**overrides: Any) -> SimpleNamespace:
+    advanced_configs = SimpleNamespace(
+        model_dump=lambda: {
+            "vmEgressPolicy": {
+                "accepted": True,
+                "allowlist": ["example.com", "google.com"],
+                "denylist": None,
+                "generation": 3,
+            },
+            "customSetting": True,
+        }
+    )
+    return _fake_sandbox(
+        start_command=StartCommand(executable="tail", args=["-f", "/dev/null"]),
+        disk_size_gb=10.0,
+        disk_mount_path="/sandbox-workspace",
+        vm=True,
+        network_allowlist=["example.com", "google.com"],
+        network_denylist=None,
+        idle_timeout_minutes=None,
+        termination_reason=None,
+        terminated_at=None,
+        exit_code=None,
+        environment_vars=None,
+        secrets=None,
+        advanced_configs=advanced_configs,
+        user_id="user-1",
+        team_id=None,
+        **overrides,
+    )
+
+
+def _network_status(
+    *,
+    allowlist: list[str] | None = None,
+    denylist: list[str] | None = None,
+    applied: bool = True,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        policy=SimpleNamespace(allowlist=allowlist, denylist=denylist),
+        generation=2,
+        applied_generation=2 if applied else -1,
+        applied=applied,
+    )
+
+
+def _configure_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+
+def test_list_uses_temporary_context_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    config_dir = tmp_path / ".prime"
+    environments_dir = config_dir / "environments"
+    environments_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "api_key": "production-key",
+                "base_url": "https://api.production.example",
+                "team_id": "production-team",
+                "user_id": "production-user",
+            }
+        )
+    )
+    (environments_dir / "dev.json").write_text(
+        json.dumps(
+            {
+                "api_key": "dev-key",
+                "base_url": "https://api.dev.example",
+                "team_id": "dev-team",
+                "user_id": "dev-user",
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+    for name in (
+        "PRIME_CONTEXT",
+        "PRIME_API_KEY",
+        "PRIME_API_BASE_URL",
+        "PRIME_BASE_URL",
+        "PRIME_TEAM_ID",
+        "PRIME_USER_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    captured: dict[str, Any] = {}
+
+    def mock_list(self: Any, **kwargs: Any) -> SimpleNamespace:
+        captured.update(
+            {
+                "api_key": self.client.api_key,
+                "base_url": self.client.base_url,
+                "team_id": self.client.config.team_id,
+                "user_id": self.client.config.user_id,
+            }
+        )
+        return SimpleNamespace(sandboxes=[], total=0, page=1, per_page=50, has_next=False)
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+
+    result = runner.invoke(app, ["-c", "dev", "sandbox", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "api_key": "dev-key",
+        "base_url": "https://api.dev.example",
+        "team_id": "dev-team",
+        "user_id": "dev-user",
+    }
+
+
+def test_sandbox_network_without_flags_shows_current_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    calls: list[str] = []
+
+    def mock_get_network(self: Any, sandbox_id: str) -> SimpleNamespace:
+        calls.append(sandbox_id)
+        return _network_status(denylist=[])
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get_network", mock_get_network)
+
+    result = runner.invoke(app, ["sandbox", "network", "sbx-1"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert calls == ["sbx-1"]
+    assert "Network access for sbx-1" in output
+    assert "Internet access: unrestricted" in output
+    assert "generation" not in output.lower()
+
+
+def test_sandbox_network_warns_when_rules_are_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    def mock_get_network(self: Any, sandbox_id: str) -> SimpleNamespace:
+        return _network_status(denylist=[], applied=False)
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get_network", mock_get_network)
+
+    result = runner.invoke(app, ["sandbox", "network", "sbx-1"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert "not active yet" in output
+    assert "Retrying automatically" in output
+    assert "generation" not in output.lower()
+
+
+@pytest.mark.parametrize(
+    ("allowlist", "denylist", "expected"),
+    [
+        (["example.com", "google.com"], None, "Access limited to: example.com, google.com"),
+        ([], None, "Internet access: blocked"),
+        (None, ["example.com", "google.com"], "Blocked: example.com, google.com"),
+        (None, [], "Internet access: unrestricted"),
+    ],
+)
+def test_sandbox_network_describes_effective_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: list[str] | None,
+    denylist: list[str] | None,
+    expected: str,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    def mock_get_network(self: Any, sandbox_id: str) -> SimpleNamespace:
+        return _network_status(allowlist=allowlist, denylist=denylist)
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get_network", mock_get_network)
+
+    result = runner.invoke(app, ["sandbox", "network", "sbx-1"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert expected in output
+    assert "generation" not in output.lower()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            ["--allow", "api.example.com, 10.0.0.0/8"],
+            {
+                "allow": ["api.example.com", "10.0.0.0/8"],
+                "deny": None,
+            },
+        ),
+        (
+            ["--deny", "ads.example.com,192.0.2.0/24"],
+            {
+                "allow": None,
+                "deny": ["ads.example.com", "192.0.2.0/24"],
+            },
+        ),
+        (
+            ["--allow", "*"],
+            {
+                "allow": ["*"],
+                "deny": None,
+            },
+        ),
+        (
+            ["--deny", "*"],
+            {
+                "allow": None,
+                "deny": ["*"],
+            },
+        ),
+    ],
+)
+def test_sandbox_network_flags_replace_rules(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    expected: dict[str, Any],
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_set_network(self: Any, sandbox_id: str, **kwargs: Any) -> SimpleNamespace:
+        captured["sandbox_id"] = sandbox_id
+        captured.update(kwargs)
+        return _network_status(denylist=[])
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.set_network", mock_set_network)
+
+    result = runner.invoke(app, ["sandbox", "network", "sbx-1", *arguments])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"sandbox_id": "sbx-1", "rules": None, **expected}
+
+
+def test_sandbox_network_rejects_multiple_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--allow",
+            "api.example.com",
+            "--deny",
+            "ads.example.com",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 1
+    assert "provide at most one of" in output
+
+
+def test_sandbox_network_replaces_instead_of_accumulating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    def mock_set_network(self: Any, sandbox_id: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"sandbox_id": sandbox_id, **kwargs})
+        return _network_status(allowlist=kwargs["allow"])
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.set_network", mock_set_network)
+
+    first = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--allow", "example.com"],
+    )
+    second = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--allow", "google.com"],
+    )
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert "✓ Network access updated" in strip_ansi(first.output)
+    assert "Access limited to: example.com" in strip_ansi(first.output)
+    assert "generation" not in strip_ansi(first.output).lower()
+    assert "Access limited to: google.com" in strip_ansi(second.output)
+    assert calls == [
+        {"sandbox_id": "sbx-1", "allow": ["example.com"], "deny": None, "rules": None},
+        {"sandbox_id": "sbx-1", "allow": ["google.com"], "deny": None, "rules": None},
+    ]
+
+
+def test_sandbox_network_rejects_empty_comma_separated_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--allow", "example.com,,google.com"],
+    )
+
+    assert result.exit_code == 1
+    assert "comma-separated list" in strip_ansi(result.output)
+
+
+def test_sandbox_get_renders_network_as_first_class_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    sandbox = _fake_detailed_sandbox()
+    monkeypatch.setattr(
+        "prime_cli.commands.sandbox.SandboxClient.get",
+        lambda self, sandbox_id: sandbox,
+    )
+
+    table_result = runner.invoke(app, ["sandbox", "get", "sbx-1"])
+
+    table_output = strip_ansi(table_result.output)
+    assert table_result.exit_code == 0, table_result.output
+    assert "Network Access" in table_output
+    assert "Limited to: example.com, google.com" in table_output
+    assert "Egress Allowlist" not in table_output
+    assert "vmEgressPolicy" not in table_output
+    assert "generation" not in table_output
+    assert "customSetting" in table_output
+
+    json_result = runner.invoke(app, ["sandbox", "get", "sbx-1", "--output", "json"])
+
+    assert json_result.exit_code == 0, json_result.output
+    json_output = json.loads(json_result.output)
+    assert json_output["network_allowlist"] == ["example.com", "google.com"]
+    assert json_output["network_denylist"] is None
+    assert json_output["advanced_configs"] == {"customSetting": True}
+
+
+def test_sandbox_create_with_gpu_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-gpu-123")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "team-1/gpu-runtime:v1",
+            "--vm",
+            "--gpu-count",
+            "1",
+            "--gpu-type",
+            "H100_80GB",
+            "--yes",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Successfully created sandbox sbx-gpu-123" in output
+    assert "Runtime: VM" in output
+    assert "GPUs: H100_80GB x1" in output
+    assert "Docker Image: team-1/gpu-runtime:v1" in output
+    assert captured["request"].docker_image == "team-1/gpu-runtime:v1"
+    assert captured["request"].gpu_count == 1
+    assert captured["request"].gpu_type == "H100_80GB"
+
+
+def test_sandbox_create_vm_accepts_fractional_disk_size_gb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-vm-disk")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "team-1/vm:v1",
+            "--vm",
+            "--disk-size-gb",
+            "10.0009765625",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["request"].disk_size_gb == 10241 / 1024
+    assert "10.0009765625GB disk" in strip_ansi(result.output)
+
+
+def test_sandbox_create_vm_start_command_preserves_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-vm-command")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "team-1/worker:v1",
+            "--vm",
+            "--yes",
+            "--",
+            "/worker",
+            "--platform",
+            "linux/amd64",
+            "value with spaces",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    command = captured["request"].start_command
+    assert command.executable == "/worker"
+    assert command.args == ["--platform", "linux/amd64", "value with spaces"]
+    assert '["/worker", "--platform", "linux/amd64", "value with spaces"]' in strip_ansi(
+        result.output
+    )
+
+
+def test_sandbox_create_omitted_image_preserves_command_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-default-image-command")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "--cpu-cores",
+            "2",
+            "--yes",
+            "--",
+            "python",
+            "script.py",
+            "--verbose",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    request = captured["request"]
+    assert request.docker_image == "python:3.11-slim"
+    assert request.cpu_cores == 2
+    assert request.start_command.executable == "python"
+    assert request.start_command.args == ["script.py", "--verbose"]
+
+
+def test_sandbox_create_defaults_to_vm_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without --vm the CLI resolves the runtime to VM."""
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-default-vm")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "create", "python:3.12", "--yes"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert "Runtime: VM (default)" in output
+    assert captured["request"].start_command is None
+
+
+def test_sandbox_create_arm_alias_sends_arm64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-arm")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+    result = runner.invoke(
+        app, ["sandbox", "create", "prime/user/app:arm", "--arch", "arm", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["request"].arch == "arm64"
+
+
+def test_sandbox_create_gpu_without_docker_image_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-gpu-default-image")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "--gpu-count",
+            "1",
+            "--gpu-type",
+            "RTX_PRO_6000",
+            "--yes",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert "Successfully created sandbox sbx-gpu-default-image" in output
+    assert captured["request"].docker_image == "python:3.11-slim"
+
+
+def test_sandbox_create_accepts_docker_image_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-gpu-with-image")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--vm",
+            "--gpu-count",
+            "1",
+            "--gpu-type",
+            "H100_80GB",
+            "--yes",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Successfully created sandbox sbx-gpu-with-image" in output
+    assert captured["request"].docker_image == "python:3.11-slim"
+    assert captured["request"].gpu_count == 1
+    assert captured["request"].gpu_type == "H100_80GB"
+
+
+def test_sandbox_create_accepts_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-eu-west")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--region",
+            "eu-west",
+            "--yes",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Successfully created sandbox sbx-eu-west" in output
+    assert "Region: eu-west" in output
+    assert captured["request"].region == "eu-west"
+
+
+def test_sandbox_create_summary_shows_env_team(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+    monkeypatch.setenv("PRIME_TEAM_ID", "team-from-env")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-team-env")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(app, ["sandbox", "create", "python:3.11-slim", "--yes"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Team: team-from-env" in output
+    assert "Team: Personal" not in output
+    # The flag is still absent from the request; the SDK resolves it.
+    assert captured["request"].team_id is None
+
+
+def test_sandbox_create_requires_gpu_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    called = False
+
+    def mock_create(self: Any, request: Any) -> Any:
+        nonlocal called
+        called = True
+        return SimpleNamespace(id="sbx-should-not-create")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "create", "--gpu-count", "1", "--yes"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 1
+    assert "GPU type is required when requesting GPUs." in output
+    assert called is False
+
+
+def test_sandbox_create_gpu_with_defaulted_vm_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GPU requests work without an explicit --vm now that VM is the default."""
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-gpu-default-vm")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--gpu-count",
+            "1",
+            "--gpu-type",
+            "H100_80GB",
+            "--yes",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Successfully created sandbox sbx-gpu-default-vm" in output
+    assert captured["request"].gpu_count == 1
+
+
+def test_sandbox_create_rejects_gpu_type_without_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    called = False
+
+    def mock_create(self: Any, request: Any) -> Any:
+        nonlocal called
+        called = True
+        return SimpleNamespace(id="sbx-should-not-create")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "create", "--gpu-type", "H100_80GB", "--yes"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 1
+    assert "GPU type provided without GPUs." in output
+    assert called is False
+
+
+def test_sandbox_create_without_arguments_uses_default_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-default-image")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(app, ["sandbox", "create"], input="\n")
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert "Docker Image: python:3.11-slim" in output
+    assert "Successfully created sandbox sbx-default-image" in output
+    assert captured["request"].docker_image == "python:3.11-slim"
+
+
+def test_sandbox_create_vm_without_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-vm-123")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "create", "user-1/vm-image:latest", "--vm", "--yes"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Successfully created sandbox sbx-vm-123" in output
+    assert captured["request"].gpu_count == 0
+    assert captured["request"].cpu_cores == 1.0
+    assert captured["request"].memory_gb == 1.0
+
+
+def test_sandbox_create_vm_supports_idle_timeout_with_unlimited_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-vm-idle")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.12",
+            "--vm",
+            "--timeout-minutes",
+            "-1",
+            "--idle-timeout-minutes",
+            "10",
+            "--yes",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, result.output
+    assert "Idle Timeout: 10 minutes" in output
+    assert captured["request"].timeout_minutes == -1
+    assert captured["request"].idle_timeout_minutes == 10
+
+
+def test_sandbox_delete_by_label_scopes_to_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default --label delete scopes to the caller's user_id server-side.
+
+    The CLI now makes a single ``list(per_page=1)`` call to preview the count,
+    then a single ``bulk_delete`` with the scope/labels — the server does the
+    filtering, so no pagination and no client-side user_id filter.
+    """
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+    monkeypatch.setenv("PRIME_USER_ID", "user-1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_list(self: Any, **kwargs: Any) -> Any:
+        captured["list_kwargs"] = kwargs
+        return SimpleNamespace(
+            sandboxes=[SimpleNamespace(id="sbx-owned", user_id="user-1")],
+            total=1,
+            page=1,
+            per_page=1,
+            has_next=False,
+        )
+
+    def mock_bulk_delete(self: Any, **kwargs: Any) -> Any:
+        captured["bulk_delete_kwargs"] = kwargs
+        return SimpleNamespace(
+            succeeded=["sbx-owned"],
+            failed=[],
+            message="deleted",
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.bulk_delete", mock_bulk_delete)
+
+    result = runner.invoke(app, ["sandbox", "delete", "--label", "keep", "--yes"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+
+    # Preview call: scoped to caller + labels, only active sandboxes
+    list_kwargs = captured["list_kwargs"]
+    assert list_kwargs["labels"] == ["keep"]
+    assert list_kwargs["user_id"] == "user-1"
+    assert list_kwargs["exclude_terminated"] is True
+    assert list_kwargs["per_page"] == 1
+
+    # Delete call: server-side scope, no client-side ID list
+    bulk_kwargs = captured["bulk_delete_kwargs"]
+    assert bulk_kwargs["labels"] == ["keep"]
+    assert bulk_kwargs["user_id"] == "user-1"
+    assert bulk_kwargs["all_users"] is False
+    assert bulk_kwargs.get("sandbox_ids") is None
+
+    assert "Successfully deleted 1 sandbox(es):" in output
+
+
+def test_sandbox_delete_by_label_all_users_passes_admin_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--all-users flips user_id scoping to all_users=True (server admin-gated)."""
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+    monkeypatch.setenv("PRIME_USER_ID", "user-1")
+
+    captured: dict[str, Any] = {}
+
+    def mock_list(self: Any, **kwargs: Any) -> Any:
+        captured["list_kwargs"] = kwargs
+        return SimpleNamespace(
+            sandboxes=[SimpleNamespace(id="sbx-active", user_id="user-1")],
+            total=1,
+            page=1,
+            per_page=1,
+            has_next=False,
+        )
+
+    def mock_bulk_delete(self: Any, **kwargs: Any) -> Any:
+        captured["bulk_delete_kwargs"] = kwargs
+        return SimpleNamespace(
+            succeeded=["sbx-active"],
+            failed=[],
+            message="deleted",
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.bulk_delete", mock_bulk_delete)
+
+    result = runner.invoke(app, ["sandbox", "delete", "--label", "archive", "--all-users", "--yes"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+
+    list_kwargs = captured["list_kwargs"]
+    assert list_kwargs["labels"] == ["archive"]
+    assert list_kwargs["exclude_terminated"] is True
+    assert list_kwargs["user_id"] is None
+
+    bulk_kwargs = captured["bulk_delete_kwargs"]
+    assert bulk_kwargs["labels"] == ["archive"]
+    assert bulk_kwargs["all_users"] is True
+    assert bulk_kwargs["user_id"] is None
+
+    assert "Processed 1 sandbox(es)" in output
+
+
+def test_format_sandbox_expiry_running_shows_time_left() -> None:
+    now = datetime.now(timezone.utc)
+    sb = _fake_sandbox(status="RUNNING", started_at=now - timedelta(minutes=10), timeout_minutes=60)
+    result = _format_sandbox_expiry(sb)
+    # ~50 minutes left; assert the shape, not the exact minute (avoids clock flakiness).
+    assert result.endswith("left")
+    assert "timeout" not in result
+
+
+def test_format_sandbox_expiry_not_started_shows_timeout() -> None:
+    # No started_at yet -> the clock hasn't begun, so show the configured budget.
+    pending = _fake_sandbox(status="PENDING", started_at=None, timeout_minutes=60)
+    provisioning = _fake_sandbox(status="PROVISIONING", started_at=None, timeout_minutes=30)
+    assert _format_sandbox_expiry(pending) == "60m timeout"
+    assert _format_sandbox_expiry(provisioning) == "30m timeout"
+
+
+def test_format_sandbox_expiry_past_deadline_is_expiring() -> None:
+    now = datetime.now(timezone.utc)
+    sb = _fake_sandbox(
+        status="RUNNING", started_at=now - timedelta(minutes=120), timeout_minutes=60
+    )
+    assert _format_sandbox_expiry(sb) == "expiring"
+
+
+@pytest.mark.parametrize("status", ["TERMINATED", "TIMEOUT", "ERROR"])
+def test_format_sandbox_expiry_terminal_has_no_time_left(status: str) -> None:
+    assert _format_sandbox_expiry(_fake_sandbox(status=status)) == "-"
+
+
+def test_sandbox_list_table_has_expires_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+    monkeypatch.setenv("COLUMNS", "200")  # keep the wide table from wrapping the header
+
+    now = datetime.now(timezone.utc)
+
+    def mock_list(self: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            sandboxes=[
+                _fake_sandbox(
+                    id="sbx-run",
+                    status="RUNNING",
+                    started_at=now - timedelta(minutes=10),
+                    timeout_minutes=60,
+                ),
+                _fake_sandbox(
+                    id="sbx-pending", status="PENDING", started_at=None, timeout_minutes=45
+                ),
+            ],
+            total=2,
+            page=1,
+            per_page=50,
+            has_next=False,
+            next_cursor=None,
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+
+    result = runner.invoke(app, ["sandbox", "list"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Expires" in output
+    assert "left" in output  # running sandbox shows time remaining
+    assert "45m timeout" in output  # pending sandbox shows its configured budget
+
+
+def test_sandbox_list_json_includes_expiry_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRIME_API_KEY", "dummy")
+    monkeypatch.setenv("PRIME_DISABLE_VERSION_CHECK", "1")
+
+    now = datetime.now(timezone.utc)
+
+    def mock_list(self: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            sandboxes=[
+                _fake_sandbox(
+                    id="sbx-run",
+                    status="RUNNING",
+                    started_at=now - timedelta(minutes=10),
+                    timeout_minutes=60,
+                ),
+                _fake_sandbox(
+                    id="sbx-pending", status="PENDING", started_at=None, timeout_minutes=45
+                ),
+            ],
+            total=2,
+            page=1,
+            per_page=50,
+            has_next=False,
+            next_cursor=None,
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+
+    result = runner.invoke(app, ["sandbox", "list", "--output", "json"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    import json as _json
+
+    data = _json.loads(result.output)
+    by_id = {s["id"]: s for s in data["sandboxes"]}
+    # Running sandbox has a concrete deadline; pending one has none yet.
+    assert by_id["sbx-run"]["timeout_minutes"] == 60
+    assert by_id["sbx-run"]["expires_at"] is not None
+    assert by_id["sbx-pending"]["timeout_minutes"] == 45
+    assert by_id["sbx-pending"]["expires_at"] is None
+
+
+def test_sandbox_list_cursor_mode_json_includes_next_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_list(self: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            sandboxes=[],
+            total=None,
+            page=1,
+            per_page=50,
+            has_next=True,
+            next_cursor="cursor-2",
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+
+    result = runner.invoke(app, ["sandbox", "list", "--cursor", "cursor-1", "--output", "json"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    data = json.loads(result.output)
+    assert captured["cursor"] == "cursor-1"
+    assert "page" not in captured
+    # Cursor mode has no count, but offers the next cursor
+    assert data["total"] is None
+    assert data["next_cursor"] == "cursor-2"
+    assert data["has_next"] is True
+    assert "page" not in data
+
+
+def test_sandbox_list_rejects_page_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(app, ["sandbox", "list", "--page", "2"])
+
+    assert result.exit_code != 0
+
+
+def test_sandbox_list_table_prints_cursor_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+
+    def mock_list(self: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            sandboxes=[],
+            total=None,
+            per_page=50,
+            has_next=True,
+            next_cursor="cursor-2",
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.list", mock_list)
+
+    result = runner.invoke(app, ["sandbox", "list"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Use --cursor cursor-2 to see more." in output
+
+
+def test_sandbox_create_defaults_disk_size_gb_to_5(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-default-disk")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(app, ["sandbox", "create", "team-1/vm:v1", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["request"].disk_size_gb == 5.0
+    assert "5.0GB disk" in strip_ansi(result.output)
+
+
+@pytest.mark.parametrize("user_option", [[], ["--user", "ubuntu"], ["-u", "ubuntu"]])
+def test_sandbox_run_forwards_guest_user(monkeypatch, user_option):
+    calls = []
+
+    class FakeSandboxClient:
+        def __init__(self, _client):
+            pass
+
+        def execute_command(self, *args, user=None, **kwargs):
+            calls.append((args, {**kwargs, "user": user}))
+            return SimpleNamespace(stdout="", stderr="", exit_code=0)
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.APIClient", lambda: object())
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient", FakeSandboxClient)
+    result = runner.invoke(app, ["sandbox", "run", "sbx-1", *user_option, "--", "id"])
+    assert result.exit_code == 0, result.output
+    assert calls[0][0][:2] == ("sbx-1", "id")
+    assert calls[0][1].get("user") == ("ubuntu" if user_option else None)
+
+
+@pytest.mark.parametrize("user_option", [[], ["--user", "ubuntu"]])
+def test_sandbox_run_with_old_sdk(monkeypatch, user_option):
+    calls = []
+
+    class OldSandboxClient:
+        def __init__(self, _client):
+            pass
+
+        def execute_command(self, sandbox_id, command, working_dir, env, timeout=None):
+            calls.append((sandbox_id, command))
+            return SimpleNamespace(stdout="", stderr="", exit_code=0)
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.APIClient", lambda: object())
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient", OldSandboxClient)
+    result = runner.invoke(app, ["sandbox", "run", "sbx-1", *user_option, "--", "id"])
+    if user_option:
+        assert result.exit_code == 1
+        assert "does not support --user" in result.output
+        assert "Upgrade prime-sandboxes" in " ".join(result.output.split())
+        assert calls == []
+    else:
+        assert result.exit_code == 0, result.output
+        assert calls == [("sbx-1", "id")]
+
+
+def test_checkpoint_delete_by_ids_and_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    from prime_sandboxes import APIError, DeleteSandboxCheckpointsResponse
+
+    _configure_cli(monkeypatch)
+    calls: list[Any] = []
+
+    def delete(self: Any, checkpoint_id: str) -> None:
+        calls.append(checkpoint_id)
+        if checkpoint_id == "c3":
+            raise APIError("HTTP 409: busy")
+
+    def delete_all(self: Any, sandbox_id: str) -> DeleteSandboxCheckpointsResponse:
+        calls.append(("sandbox", sandbox_id))
+        return DeleteSandboxCheckpointsResponse.model_validate(
+            {
+                "deleted": ["c1"],
+                "errors": [{"checkpoint_id": "c2", "code": "CONFLICT", "message": "busy"}],
+            }
+        )
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.delete_checkpoint", delete)
+    monkeypatch.setattr(
+        "prime_cli.commands.sandbox.SandboxClient.delete_sandbox_checkpoints", delete_all
+    )
+
+    by_ids = runner.invoke(
+        app, ["sandbox", "checkpoint", "delete", "c1,c2", "c3", "c1", "-y", "-o", "json"]
+    )
+    assert by_ids.exit_code == 1
+    result = json.loads(by_ids.output)
+    assert result["deleted"] == ["c1", "c2"]
+    assert result["errors"][0]["checkpoint_id"] == "c3"
+
+    by_sandbox = runner.invoke(app, ["sandbox", "checkpoint", "delete", "--sandbox", "sbx-1", "-y"])
+    assert by_sandbox.exit_code == 1
+    assert "Deleted checkpoint c1" in by_sandbox.output
+    assert "Failed to delete c2" in by_sandbox.output
+
+    both = runner.invoke(app, ["sandbox", "checkpoint", "delete", "c1", "--sandbox", "sbx-1"])
+    assert both.exit_code == 1
+    assert calls == ["c1", "c2", "c3", ("sandbox", "sbx-1")]
+
+
+def test_pause_and_resume_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_cli(monkeypatch)
+    calls: list[tuple[str, str]] = []
+
+    def pause(self: Any, sandbox_id: str) -> SimpleNamespace:
+        calls.append(("pause", sandbox_id))
+        return SimpleNamespace(status="RUNNING")
+
+    def resume(self: Any, sandbox_id: str) -> SimpleNamespace:
+        calls.append(("resume", sandbox_id))
+        return SimpleNamespace(status="PAUSED")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.pause", pause)
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.resume", resume)
+
+    paused = runner.invoke(app, ["sandbox", "pause", "sandbox-1"])
+    assert paused.exit_code == 0, paused.output
+    assert "becomes PAUSED" in strip_ansi(paused.output)
+
+    resumed = runner.invoke(app, ["sandbox", "resume", "sandbox-1"])
+    assert resumed.exit_code == 0, resumed.output
+    assert "becomes RUNNING" in strip_ansi(resumed.output)
+    assert calls == [("pause", "sandbox-1"), ("resume", "sandbox-1")]
+
+
+def _network_status_with_rules(
+    *, allowlist: list[str] | None = None, denylist: list[str] | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        policy=SimpleNamespace(
+            allowlist=allowlist,
+            denylist=denylist,
+            rules={"api.example.com": HeaderRule(headers={"Authorization": "Bearer tok"})},
+        ),
+        generation=2,
+        applied_generation=2,
+        applied=True,
+    )
+
+
+def test_sandbox_network_inject_header_joins_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_set_network(self: Any, sandbox_id: str, **kwargs: Any) -> SimpleNamespace:
+        captured.clear()
+        captured["sandbox_id"] = sandbox_id
+        captured.update(kwargs)
+        return _network_status(allowlist=["*"])
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.set_network", mock_set_network)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--allow",
+            "*",
+            "--inject-header",
+            "api.example.com",
+            "Authorization: Bearer ${prime.secrets.OPENAI_KEY}",
+            "--inject-header",
+            "api.example.com",
+            "X-Api-Key: k",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["allow"] == ["*"]
+    assert captured["rules"] == {
+        "api.example.com": HeaderRule(
+            headers={
+                "Authorization": "Bearer ${prime.secrets.OPENAI_KEY}",
+                "X-Api-Key": "k",
+            }
+        )
+    }
+
+
+def test_sandbox_network_inject_header_requires_destinations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    set_network = {}
+    monkeypatch.setattr(
+        "prime_cli.commands.sandbox.SandboxClient.set_network",
+        lambda self, sandbox_id, **kwargs: set_network.update(kwargs),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--inject-header",
+            "api.example.com",
+            "Authorization: Bearer ${prime.secrets.OPENAI_KEY}",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "complete" in output
+
+
+def test_sandbox_network_rejects_duplicate_header_for_one_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--allow",
+            "*",
+            "--inject-header",
+            "api.example.com",
+            "Authorization: a",
+            "--inject-header",
+            "api.example.com",
+            "Authorization: b",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "set twice" in output
+
+
+def test_sandbox_network_rejects_malformed_inject_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--allow",
+            "*",
+            "--inject-header",
+            "api.example.com",
+            "no-colon",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "expects" in output
+
+
+def test_sandbox_network_policy_file_replaces_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+    policy = {
+        "allow": ["api.example.com"],
+        "rules": {
+            "api.example.com": {"headers": {"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}}
+        },
+    }
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps(policy))
+
+    def mock_set_network(self: Any, sandbox_id: str, **kwargs: Any) -> SimpleNamespace:
+        captured.clear()
+        captured["sandbox_id"] = sandbox_id
+        captured.update(kwargs)
+        return _network_status(allowlist=["api.example.com"])
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.set_network", mock_set_network)
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--network-policy", str(policy_file)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "sandbox_id": "sbx-1",
+        "allow": ["api.example.com"],
+        "deny": None,
+        "rules": {
+            "api.example.com": HeaderRule(
+                headers={"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}
+            )
+        },
+    }
+
+
+def test_sandbox_network_policy_file_invalid_rule_hides_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps({"allow": ["*"], "rules": {"api.example.com": {"headers": "Bearer sk-literal"}}})
+    )
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--network-policy", str(policy_file)],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "sk-literal" not in output
+    assert "headers: Input should be a valid dictionary" in output
+
+
+def test_sandbox_network_policy_file_rejects_unknown_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"allow": ["*"], "extra": 1}))
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--network-policy", str(policy_file)],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "unknown network policy keys: extra" in output
+
+
+def test_sandbox_network_policy_file_conflicts_with_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"allow": ["*"], "rules": {}}))
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--allow",
+            "example.com",
+            "--network-policy",
+            str(policy_file),
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "at most one of --allow and --network-policy allow" in output
+
+
+def test_sandbox_network_policy_file_rejects_both_lists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"allow": ["*"], "deny": ["a.com"], "rules": {}}))
+
+    result = runner.invoke(
+        app,
+        ["sandbox", "network", "sbx-1", "--network-policy", str(policy_file)],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "at most one of allow and deny" in output
+
+
+def test_sandbox_network_shows_header_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    def mock_get_network(self: Any, sandbox_id: str) -> SimpleNamespace:
+        return _network_status_with_rules(denylist=[])
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.get_network", mock_get_network)
+
+    result = runner.invoke(app, ["sandbox", "network", "sbx-1"])
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 0, result.output
+    assert "Header rules: api.example.com: 1 header(s)" in output
+
+
+def test_sandbox_create_accepts_inject_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-rules-1")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--inject-header",
+            "api.example.com",
+            "Authorization: Bearer ${prime.secrets.OPENAI_KEY}",
+            "--yes",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 0, output
+    assert captured["request"].network_rules == {
+        "api.example.com": HeaderRule(
+            headers={"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}
+        )
+    }
+    assert "Header Rules: api.example.com: 1 header(s)" in output
+
+
+def test_sandbox_create_accepts_network_policy_file_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    captured: dict[str, Any] = {}
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "allow": ["api.example.com"],
+                "rules": {
+                    "api.example.com": {
+                        "headers": {"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}
+                    }
+                },
+            }
+        )
+    )
+
+    def mock_create(self: Any, request: Any) -> Any:
+        captured["request"] = request
+        return SimpleNamespace(id="sbx-rules-1")
+
+    monkeypatch.setattr("prime_cli.commands.sandbox.SandboxClient.create", mock_create)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--network-policy",
+            str(policy_file),
+            "--yes",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 0, output
+    assert captured["request"].network_allowlist == ["api.example.com"]
+    assert captured["request"].network_rules == {
+        "api.example.com": HeaderRule(
+            headers={"Authorization": "Bearer ${prime.secrets.OPENAI_KEY}"}
+        )
+    }
+    assert "Header Rules: api.example.com: 1 header(s)" in output
+
+
+def test_sandbox_create_invalid_rule_never_prints_secret_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--secret",
+            "DB_PASSWORD=hunter2-plaintext",
+            "--inject-header",
+            "api.example.com",
+            "Authorization: a",
+            "--inject-header",
+            "api.example.com",
+            "authorization: b",
+            "--yes",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "hunter2-plaintext" not in output
+    assert "differ only by case" in output
+
+
+def test_sandbox_create_rejects_malformed_inject_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "create",
+            "python:3.11-slim",
+            "--inject-header",
+            "api.example.com",
+            "broken",
+            "--yes",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "expects 'Name: value'" in output
+
+
+def test_sandbox_network_inject_header_conflicts_with_policy_file_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _configure_cli(monkeypatch)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "allow": ["*"],
+                "rules": {"api.example.com": {"headers": {"X-Key": "v"}}},
+            }
+        )
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "sandbox",
+            "network",
+            "sbx-1",
+            "--network-policy",
+            str(policy_file),
+            "--inject-header",
+            "api.example.com",
+            "Authorization: Bearer x",
+        ],
+    )
+
+    output = _flat(strip_ansi(result.output))
+    assert result.exit_code == 1
+    assert "also set in --network-policy" in output
+
+
+def test_checkpoint_list_rejects_checkpoint_id_without_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_cli(monkeypatch)
+    for args in (
+        ["--checkpoint-id", "c1"],
+        ["sandbox-1", "--checkpoint-id", "c1", "--state", "DURABLE"],
+    ):
+        result = runner.invoke(app, ["sandbox", "checkpoint", "list", *args])
+        assert result.exit_code == 1, result.output
+        assert "--checkpoint-id needs a sandbox ID" in result.output

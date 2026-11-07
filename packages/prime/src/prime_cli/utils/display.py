@@ -1,0 +1,113 @@
+"""Display utilities for table and JSON output."""
+
+import json
+import re
+from typing import Any, Dict, List, Tuple
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from prime_cli.core import APIError, Config
+
+
+def validate_output_format(output: str, console: Console) -> None:
+    """Validate that output format is supported."""
+    if output not in ["table", "json"]:
+        console.print(
+            f"[red]Error: Invalid output format '{output}'. Supported formats: table, json[/red]"
+        )
+        raise typer.Exit(1)
+
+
+def output_data_as_json(data: Any, console: Console) -> None:
+    """Output data as formatted JSON.
+
+    `soft_wrap=True` disables Rich's terminal-width wrapping so long string
+    values don't get a literal newline injected in the middle and break
+    parsers (e.g. `prime train usage` run names regularly exceed 80 chars).
+    """
+    console.print(
+        json.dumps(data, indent=2, default=str),
+        markup=False,
+        highlight=False,
+        emoji=False,
+        soft_wrap=True,
+    )
+
+
+def api_detail(exc: APIError) -> str:
+    """The route's detail without the "HTTP 400: " / "HTTP 409: " prefix."""
+    return re.sub(r"^HTTP (400|409): ", "", str(exc))
+
+
+def build_table(title: str, columns: List[Tuple[str, str]], show_lines: bool = True) -> Table:
+    """
+    Build a Rich table with standard styling.
+
+    Args:
+        title: Table title
+        columns: List of (header, style) tuples
+        show_lines: Whether to show row separator lines
+    """
+    table = Table(title=title, show_lines=show_lines)
+    for header, style in columns:
+        table.add_column(header, style=style, no_wrap=(header == "ID"))
+    return table
+
+
+def status_color(status: str, mapping: Dict[str, str], default: str = "white") -> str:
+    """Get color for status based on mapping with fallback to default."""
+    return mapping.get(status, default)
+
+
+def get_eval_viewer_url(evaluation_id: str) -> str:
+    """Build the dashboard URL for an evaluation."""
+    frontend_url = Config().frontend_url.rstrip("/")
+    return f"{frontend_url}/dashboard/evaluations/{evaluation_id}"
+
+
+# Common status color mappings
+SANDBOX_STATUS_COLORS = {
+    "PENDING": "yellow",
+    "PROVISIONING": "yellow",
+    "RUNNING": "green",
+    "PAUSED": "blue",
+    "ERROR": "red",
+    "TERMINATED": "white",
+    "TIMEOUT": "white",
+}
+
+POD_STATUS_COLORS = {
+    "ACTIVE": "green",
+    "PENDING": "yellow",
+    "ERROR": "red",
+    "INSTALLING": "yellow",
+}
+
+STOCK_STATUS_COLORS = {
+    "High": "green",
+    "Medium": "yellow",
+    "Low": "red",
+}
+
+DISK_STATUS_COLORS = {
+    "ACTIVE": "green",
+    "PROVISIONING": "yellow",
+    "PENDING": "yellow",
+    "STOPPED": "blue",
+    "ERROR": "red",
+    "TERMINATED": "white",
+}
+
+SLURM_CLUSTER_STATUS_COLORS = {
+    "PENDING": "yellow",
+    "DEPLOYING": "yellow",
+    "RUNNING": "green",
+    "TERMINATING": "yellow",
+    "COMPLETED": "white",
+    "FAILED": "red",
+    "STOPPED": "blue",
+    "UNKNOWN": "white",
+    "TOMBSTONED": "white",
+}
